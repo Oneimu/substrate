@@ -25,6 +25,13 @@ sign a new one.
 This project follows [Google's Open Source Community
 Guidelines](https://opensource.google/conduct/).
 
+### Set up a local development environment
+
+New to the project? [docs/dev/onboarding.md](docs/dev/onboarding.md) walks
+through bringing up a local Substrate cluster on kind — for both the gVisor
+and micro-VM (KVM / Lima) runtimes — and exercising the full actor lifecycle,
+plus a troubleshooting log of common setup issues.
+
 ## Contribution process
 
 This is a very new project, so we are still working out exactly how it is going
