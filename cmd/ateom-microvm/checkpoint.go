@@ -47,11 +47,13 @@ import (
 //   - FULL: the whole guest. ateom drives the CH REST api-socket: pause -> snapshot
 //     file://<CheckpointStateDir> (config.json + state.json + sparse memory-ranges)
 //     -> tear the VMM down. Each container's rootfs is overlay(virtio-fs RO lower +
-//     guest-tmpfs upper), so the writable upper lives in guest RAM and is captured by
-//     the memory snapshot — process memory and rootfs writes both persist across
-//     suspend/resume. The RO lower is reconstructed from the OCI image at restore, so
-//     nothing rootfs-related ships. Durable-dir volumes are host-backed rather than in
-//     guest RAM, so they ship alongside as a tar.
+//     writable upper). In the default memory mode the upper lives in guest RAM and is
+//     captured by the memory snapshot — process memory and rootfs writes both persist
+//     across suspend/resume. In disk mode (--rootfs-writes=disk) the upper is
+//     host-backed like the durable-dir volumes and ships alongside as its own tar
+//     (see rootfsupper.go). The RO lower is reconstructed from the OCI image at
+//     restore, so it never ships. Durable-dir volumes are host-backed under either
+//     mode, so they ship alongside as a tar.
 //   - DATA: the durable-dir volumes only, as that same tar. The guest is discarded, so
 //     the actor cold-starts on restore with its volumes re-materialized.
 //
@@ -143,6 +145,23 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		dDurable = time.Since(tDurable)
 	}
 
+	// Disk-backed rootfs uppers: host-backed like the durable volumes, so the
+	// memory snapshot no longer carries the rootfs writes — ship them as their
+	// own tar, taken while the guest is paused (write-through share, so every
+	// completed guest write is already on the host). Only a Full snapshot
+	// carries it: under Data the workload cold-starts on restore, discarding
+	// rootfs state in either mode. Detected from the host dir the disk-mode
+	// boot created (actorHasDiskUpper), not the current flag, so the snapshot
+	// always matches the guest's actual mounts.
+	var dUpper time.Duration
+	if scope == ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL && actorHasDiskUpper(actorUID) {
+		tUpper := time.Now()
+		if err := tarRootfsUpper(ctx, ateompath.RootfsUpperDir(actorUID), checkpointDir); err != nil {
+			return nil, err
+		}
+		dUpper = time.Since(tUpper)
+	}
+
 	// Report exactly the files we wrote so atelet ships precisely this snapshot: for
 	// Full, the CH snapshot (config.json + state.json + memory-ranges + base-id) plus
 	// any durable-dir tar; for Data, that tar alone.
@@ -167,9 +186,10 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	slog.InfoContext(ctx, "Actor checkpointed", slog.String("id", actorUID), slog.Any("snapshot_files", snapshotFiles),
 		slog.String("scope", scope.String()), slog.Duration("pause", dPause),
 		slog.Duration("snapshot", dSnapshot),
-		// The durable-dir tar runs while the guest is paused, so its cost is part
-		// of the suspend latency and scales with the volume's contents.
-		slog.Duration("durable_dir", dDurable), slog.Duration("teardown", dTeardown))
+		// The durable-dir + rootfs-upper tars run while the guest is paused, so
+		// their cost is part of the suspend latency and scales with the contents.
+		slog.Duration("durable_dir", dDurable), slog.Duration("rootfs_upper", dUpper),
+		slog.Duration("teardown", dTeardown))
 	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
 }
 
@@ -219,9 +239,9 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 			slog.String("id", actorUID), slog.Duration("merge", time.Since(tMerge)))
 	}
 
-	// Nothing rootfs-related ships: the overlay's writable upper is a guest tmpfs, so
-	// the actor's rootfs writes are already in the memory snapshot above, and the RO
-	// lower is reconstructed from the OCI image at restore (it never changes).
+	// The RO lower never ships (reconstructed from the OCI image at restore). The
+	// writable upper is in the memory snapshot above when it is a guest tmpfs; a
+	// disk-backed upper ships as its own tar from CheckpointWorkload instead.
 	return dSnapshot, nil
 }
 
@@ -270,13 +290,21 @@ func (s *AteomService) teardownActor(ctx context.Context, id string, ra *running
 			_, _ = ra.chCmd.Process.Wait()
 		}
 		// Kill the virtiofsds (after CH, their only client): the overlay RO lower's
-		// and, when the actor has durable-dir volumes, the writable share's.
-		for _, cmd := range []*exec.Cmd{ra.vfsdCmd, ra.durableVfsdCmd} {
+		// and, when present, the writable durable-dir and rootfs upper shares'.
+		for _, cmd := range []*exec.Cmd{ra.vfsdCmd, ra.durableVfsdCmd, ra.upperVfsdCmd} {
 			if cmd != nil && cmd.Process != nil {
 				_ = cmd.Process.Kill()
 				_, _ = cmd.Process.Wait()
 			}
 		}
+	}
+
+	// Remove the disk-backed rootfs upper dir (a no-op in memory mode): ateom
+	// owns it — atelet's actor-dir reset doesn't know it — and its absence is
+	// what marks the actor as not disk-backed (actorHasDiskUpper). Runs after
+	// the snapshot tar above, which is already on disk.
+	if err := os.RemoveAll(ateompath.RootfsUpperDir(id)); err != nil {
+		slog.WarnContext(ctx, "Failed to remove rootfs upper dir", slog.String("actorUID", id), slog.Any("err", err))
 	}
 
 	// Sweep any leftover per-sandbox host-side state + orphaned per-sandbox

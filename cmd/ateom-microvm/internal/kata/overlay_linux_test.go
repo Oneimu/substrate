@@ -26,6 +26,7 @@ func TestVirtiofsdArgs(t *testing.T) {
 		name      string
 		opts      VirtiofsdOptions
 		wantCache string
+		wantXattr bool
 	}{
 		{
 			name:      "RO lower defaults to cache=always",
@@ -41,12 +42,29 @@ func TestVirtiofsdArgs(t *testing.T) {
 			},
 			wantCache: "--cache=auto",
 		},
+		{
+			name: "rootfs upper share passes xattrs through",
+			opts: VirtiofsdOptions{
+				SocketPath: "/run/vm/virtiofsd-upper.sock",
+				SharedDir:  "/var/lib/ateom-gvisor/actors/uid/rootfs-upper",
+				Cache:      "auto",
+				Xattr:      true,
+			},
+			wantCache: "--cache=auto",
+			wantXattr: true,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			args := virtiofsdArgs(tc.opts)
 			if !slices.Contains(args, tc.wantCache) {
 				t.Errorf("args %v do not contain %q", args, tc.wantCache)
+			}
+			// Overlay whiteouts are trusted.overlay.* xattrs in the upper; a share
+			// hosting an upper must pass them through, and the others must not pay
+			// the passthrough cost.
+			if gotXattr := slices.Contains(args, "--xattr"); gotXattr != tc.wantXattr {
+				t.Errorf("args %v: --xattr present = %v, want %v", args, gotXattr, tc.wantXattr)
 			}
 			for _, want := range []string{
 				"--socket-path=" + tc.opts.SocketPath,

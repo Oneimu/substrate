@@ -119,15 +119,16 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 // restoreFullScope restores a whole-guest snapshot: relaunch cloud-hypervisor
 // directly from it and resume.
 //
-// Each container's rootfs is overlay(virtio-fs RO lower + guest-tmpfs upper). Steps:
+// Each container's rootfs is overlay(virtio-fs RO lower + writable upper). Steps:
 // reconstruct each RO lower from the local OCI bundle (atelet re-unpacked the golden
 // image) at the frozen find-paths path and start the virtiofsd serving them; rewrite
 // the snapshot config's per-VMDir paths (vsock + serial + fs sockets) to this actor's;
 // rebuild the tap (the snapshot's virtio-net is fd-backed → fresh net_fds); relaunch
 // CH with --restore (OnDemand), and resume. Guest RAM — incl. the actor's in-memory
-// state, the tmpfs rootfs upper (so rootfs writes PERSIST), and the frozen network
-// config — comes back from the memory snapshot. Durable-dir volumes are host-backed
-// instead, and the caller has already restored them from the snapshot's tar.
+// state, a tmpfs rootfs upper when the snapshot used one (so rootfs writes PERSIST),
+// and the frozen network config — comes back from the memory snapshot. Durable-dir
+// volumes are host-backed instead, and the caller has already restored them from the
+// snapshot's tar; a disk-backed rootfs upper is re-materialized the same way below.
 func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, restoreDir string, tStart time.Time) (retErr error) {
 	actorUID := p.actorUID
 	templateNS, templateName := p.templateNS, p.templateName
@@ -153,11 +154,12 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	// Reconstruct each container's overlay RO lower from the LOCAL OCI bundle (atelet
 	// re-unpacked the golden image; the lower is the immutable golden image) at the
 	// frozen find-paths location SharedDir(id)/<cid>/rootfs, and start the one virtiofsd
-	// serving them. The writable upper is a guest tmpfs restored from the memory
-	// snapshot (rootfs writes persist), so there is no disk to rebuild or repoint; the
-	// fs socket in the snapshot config is repointed to this VMDir by
-	// rewriteSnapshotSocketPaths above. cross-node consistency relies on a deterministic
-	// unpack of the same image at the same <cid>/rootfs path.
+	// serving them. A tmpfs writable upper is restored by the memory snapshot itself
+	// (rootfs writes persist) with no disk to rebuild; a disk-backed upper is
+	// re-materialized from its tar below. The fs sockets in the snapshot config are
+	// repointed to this VMDir by rewriteSnapshotSocketPaths above. cross-node
+	// consistency relies on a deterministic unpack of the same image at the same
+	// <cid>/rootfs path.
 	containers := p.containers
 	if len(containers) == 0 {
 		return status.Error(codes.InvalidArgument, "actor spec has no containers")
@@ -193,6 +195,27 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 			if retErr != nil && durableVfsdCmd.Process != nil {
 				_ = durableVfsdCmd.Process.Kill()
 				_, _ = durableVfsdCmd.Process.Wait()
+			}
+		}()
+	}
+
+	// Disk-backed rootfs uppers: the snapshot says whether the guest expects the
+	// ateUpper share (its config.json references the fs device and the tar rides
+	// alongside), independent of this ateom's --rootfs-writes flag. Re-materialize
+	// the upper contents, then serve them exactly like the durable share — the tar
+	// reproduces the paths find-paths re-opens.
+	var upperVfsdCmd *exec.Cmd
+	if snapshotHasRootfsUpper(restoreDir) {
+		if err := untarRootfsUpper(ateompath.RootfsUpperDir(actorUID), restoreDir); err != nil {
+			return err
+		}
+		if upperVfsdCmd, err = s.stageRootfsUpperShare(ctx, rr, actorUID); err != nil {
+			return err
+		}
+		defer func() {
+			if retErr != nil && upperVfsdCmd.Process != nil {
+				_ = upperVfsdCmd.Process.Kill()
+				_, _ = upperVfsdCmd.Process.Wait()
 			}
 		}()
 	}
@@ -277,7 +300,7 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	}
 
 	ra := &runningActor{
-		chCmd: chCmd, vfsdCmd: vfsdCmd, durableVfsdCmd: durableVfsdCmd,
+		chCmd: chCmd, vfsdCmd: vfsdCmd, durableVfsdCmd: durableVfsdCmd, upperVfsdCmd: upperVfsdCmd,
 		apiSocket: apiSocket, baseID: srcID, restoreSourceDir: restoreDir,
 	}
 
@@ -338,8 +361,8 @@ func rewriteSnapshotSocketPaths(snapshotDir, id string) error {
 	// Each virtio-fs share is served by its own per-VMDir virtiofsd socket; the
 	// snapshot recorded the golden actor's, so repoint them at this actor's VMDir.
 	// Match on the device tag: the shares have separate sockets (the overlay RO
-	// lower's and, when the actor has durable-dir volumes, the writable share's), and
-	// crossing them would hand the guest the wrong filesystem.
+	// lower's and, when present, the writable durable-dir and rootfs upper shares'),
+	// and crossing them would hand the guest the wrong filesystem.
 	if fss, ok := cfg["fs"].([]any); ok {
 		for _, f := range fss {
 			fm, ok := f.(map[string]any)
@@ -351,6 +374,8 @@ func rewriteSnapshotSocketPaths(snapshotDir, id string) error {
 				fm["socket"] = kata.VirtiofsdSocketPath(id)
 			case kata.DurableFsTag:
 				fm["socket"] = kata.DurableVirtiofsdSocketPath(id)
+			case kata.UpperFsTag:
+				fm["socket"] = kata.UpperVirtiofsdSocketPath(id)
 			default:
 				return fmt.Errorf("snapshot config %q has fs device with unknown tag %q", cfgPath, tag)
 			}
