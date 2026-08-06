@@ -28,9 +28,9 @@ Guidelines](https://opensource.google/conduct/).
 ### Set up a local development environment
 
 New to the project? [docs/dev/onboarding.md](docs/dev/onboarding.md) walks
-through bringing up a local Substrate cluster on kind — for both the gVisor
-and micro-VM (KVM / Lima) runtimes — and exercising the full actor lifecycle,
-plus a troubleshooting log of common setup issues.
+through bringing up a local Substrate cluster on [kind](https://kind.sigs.k8s.io)
+— for both the gVisor and microVM runtimes — and exercising the full actor
+lifecycle, plus a troubleshooting log of common setup issues.
 
 ## Contribution process
 

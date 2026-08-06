@@ -1,11 +1,11 @@
-# Local Development Onboarding: gVisor & MicroVM on kind
+# Local Development Onboarding: gVisor & microVM on kind
 
 This guide walks a new contributor from a fresh machine to a working local
 Substrate cluster, covering both sandbox runtimes:
 
 - **gVisor** (`ateom-gvisor`) — zero hardware requirements, works anywhere
   Docker runs. Start here.
-- **MicroVM** (`ateom-microvm`, Kata + Cloud Hypervisor) — requires `/dev/kvm`,
+- **microVM** (`ateom-microvm`, Kata + Cloud Hypervisor) — requires `/dev/kvm`,
   i.e. a KVM-capable Linux host or an Apple Silicon Mac with nested
   virtualization via [Lima](https://lima-vm.io/).
 
@@ -27,7 +27,7 @@ Substrate decouples compute infrastructure from stateful agent execution:
 
 ### Runtime comparison
 
-| Dimension | gVisor | MicroVM |
+| Dimension | gVisor | microVM |
 |---|---|---|
 | Isolation boundary | Application kernel / syscall interception (Sentry) | Hardware VM (KVM + Cloud Hypervisor) |
 | Hardware requirement | None | `/dev/kvm` (bare metal, nested virt, or Lima) |
@@ -75,7 +75,7 @@ cd <your substrate checkout>
 
 # 1. Create the kind cluster (also starts a local image registry).
 #    The script probes for /dev/kvm; without it the cluster still works
-#    for gVisor — micro-VM support is simply disabled.
+#    for gVisor — microVM support is simply disabled.
 ./hack/create-kind-cluster.sh
 
 # 2. Deploy the Substrate control plane (CRDs, ate-api-server, atelet,
@@ -96,12 +96,13 @@ kubectl get workerpools,actortemplates -A # actortemplate READY=True
 
 Then jump to [§5 Workload testing](#5-workload-testing--actor-lifecycle).
 
-## 4. Path B: MicroVM on kind
+## 4. Path B: microVM on kind
 
-The micro-VM runtime needs `/dev/kvm` visible to the Docker environment where
-the kind node runs. Two supported host setups:
+The microVM runtime needs `/dev/kvm` visible to the Docker environment where
+the kind node runs. Two equally supported host setups — pick whichever matches
+your hardware:
 
-### 4.1 Option A: Linux host with KVM (recommended)
+### 4.1 Option A: Linux host with KVM
 
 Works on bare-metal Linux or any cloud VM with nested virtualization enabled
 (e.g. GCE N2/N2D instances with nested virt, or equivalent on other clouds).
@@ -115,12 +116,11 @@ ls -la /dev/kvm
 grep -cE '(vmx|svm)' /proc/cpuinfo   # >0 means CPU virt support (x86)
 ```
 
-`hack/create-kind-cluster.sh` probes for KVM by running a container with
-`--device /dev/kvm`. If your user can't access the device, add yourself to the
-`kvm` group (`sudo usermod -aG kvm "$USER"` + re-login), or as a quick
-workaround `sudo chmod 666 /dev/kvm`. (See [Known issues](#7-known-issues--planned-improvements) —
-the probe should eventually run as a root container so no host change is
-needed.)
+`hack/create-kind-cluster.sh` probes for KVM by running a root container with
+`--device /dev/kvm`, which works out of the box with a standard (rootful)
+Docker install. With **rootless Docker** the container's root is remapped to
+your user, so the probe fails with `permission denied` — use rootful Docker
+instead, or open up the device with `sudo chmod 666 /dev/kvm`.
 
 **Step 2 — create the cluster:**
 
@@ -143,7 +143,7 @@ rustfs S3 endpoint, which only exists once the control plane is deployed
 (otherwise you'll hit `upload failed: Could not connect to endpoint
 http://localhost:9000` — see the friction log).
 
-**Step 4 — run the micro-VM demo:**
+**Step 4 — run the microVM demo:**
 
 ```sh
 ./hack/run-microvm-demo-kind.sh
@@ -152,7 +152,7 @@ http://localhost:9000` — see the friction log).
 This assembles the 5 runtime assets for your architecture (skipped if they
 are already present under `bin/microvm-assets/`), stages them into
 `s3://ate-snapshots/kata-assets/` (the in-cluster rustfs bucket), re-applies
-the control plane, and deploys the micro-VM worker pool + template. See
+the control plane, and deploys the microVM worker pool + template. See
 [hack/microvm-assets/README.md](../../hack/microvm-assets/README.md) for the
 manual equivalent of each step.
 
@@ -187,7 +187,8 @@ ate-demo-counter-microvm   actortemplate.ate.dev/counter-microvm     True   1m
 ### 4.2 Option B: Apple Silicon macOS via Lima
 
 Lima can run a Linux VM with **nested virtualization**, exposing `/dev/kvm` to
-Docker (and therefore to the kind node) inside the VM.
+Docker (and therefore to the kind node) inside the VM. This is a well-trodden
+path — much of Substrate's development happens on macOS via limactl.
 
 > **Hardware requirement:** the first-generation M1 lacks hardware support for
 > ARM nested virtualization (FEAT_NV2) — Lima will fail with
@@ -218,7 +219,7 @@ mounts:
 ```
 
 (The writable home mount lets the kind/ko workflows write into your checkout;
-8 CPUs / 16 GiB is a comfortable floor for the control plane plus a micro-VM
+8 CPUs / 16 GiB is a comfortable floor for the control plane plus a microVM
 worker.)
 
 **Step 3 — assemble the arm64 assets *inside* the Lima VM:**
@@ -252,7 +253,7 @@ echo 'export DOCKER_HOST="unix://${HOME}/.lima/docker-nested/sock/docker.sock"' 
 
 cd <your substrate checkout>
 
-# Cluster + control plane + micro-VM demo
+# Cluster + control plane + microVM demo
 ./hack/create-kind-cluster.sh
 ./hack/install-ate-kind.sh --deploy-ate-system
 ./hack/run-microvm-demo-kind.sh
@@ -280,7 +281,7 @@ kubectl ate create atespace demo
 # gVisor:
 kubectl ate create actor my-counter-1 -a demo --template ate-demo-counter/counter
 
-# MicroVM:
+# microVM:
 kubectl ate create actor my-counter-1 -a demo --template ate-demo-counter-microvm/counter-microvm
 ```
 
@@ -304,7 +305,7 @@ kubectl port-forward -n ate-system svc/atenet-router 8080:80 &
 # locate (and, if needed, resume) the actor:
 curl -s -H "Host: my-counter-1.demo.actors.resources.substrate.ate.dev" http://localhost:8080/
 curl -s -H "Host: my-counter-1.demo.actors.resources.substrate.ate.dev" http://localhost:8080/
-# -> Greeting from pod ... requestCount=2, fileCount=2
+# -> hello from: <pod ip> | preserved memory count: 2 | preserved file counter: 2
 ```
 
 ### 5.5 State persistence across suspend/resume ("teleport")
@@ -319,7 +320,7 @@ kubectl ate resume actor my-counter-1 -a demo
 
 # In-memory state survived the round trip:
 curl -s -H "Host: my-counter-1.demo.actors.resources.substrate.ate.dev" http://localhost:8080/
-# -> requestCount=3, fileCount=3
+# -> hello from: <pod ip> | preserved memory count: 3 | preserved file counter: 3
 ```
 
 The counter continuing from where it left off — potentially on a *different*
@@ -343,9 +344,9 @@ Issues actually hit during onboarding, with root causes and fixes:
 | # | Symptom | Root cause | Fix |
 |---|---|---|---|
 | 1 | `permission denied while trying to connect to the docker API` | User not in the `docker` group (or group not active in this session) | `sudo usermod -aG docker "$USER"` then `newgrp docker` or re-login |
-| 2 | `/dev/kvm: permission denied` during the kind KVM probe | Default `/dev/kvm` permissions (`660 root:kvm`) block the non-root probe container | Add yourself to the `kvm` group and re-login, or `sudo chmod 666 /dev/kvm` before `./hack/create-kind-cluster.sh` (see known issue below) |
+| 2 | `/dev/kvm: permission denied` during the kind KVM probe | Rootless Docker: the probe container's root is remapped to your user, which can't open the device (`660 root:kvm`) | Use rootful Docker, or `sudo chmod 666 /dev/kvm` before `./hack/create-kind-cluster.sh` |
 | 3 | `kubectl: command not found` from install scripts | `kubectl` not installed | Install per [kubernetes.io/docs/tasks/tools](https://kubernetes.io/docs/tasks/tools/) |
-| 4 | `error: the 'aws' CLI is required but was not found in PATH` | `stage-to-rustfs.sh` uses `aws s3 cp` to stage micro-VM assets | Install the AWS CLI, or use the dockerized alias in §4.1 (see known issue below) |
+| 4 | `error: the 'aws' CLI is required but was not found in PATH` | `stage-to-rustfs.sh` uses `aws s3 cp` to stage microVM assets | Install the AWS CLI, or use the dockerized alias in §4.1 (see known issue below) |
 | 5 | `upload failed: Could not connect to endpoint http://localhost:9000` | Assets staged before the control plane (and rustfs) were deployed | Run `./hack/install-ate-kind.sh --deploy-ate-system` first |
 | 6 | `error: unknown command "ate" for "kubectl"` | `go install ./cmd/kubectl-ate` put the plugin in `$(go env GOPATH)/bin`, which isn't on `PATH` | `export PATH="$(go env GOPATH)/bin:${PATH}"` (persist it in your shell rc) |
 | 7 | Lima: `[hostagent] Starting VZ ... FATA exiting` on M1 | M1 lacks FEAT_NV2 hardware nested virtualization | Use a newer Apple Silicon Mac, or a Linux/KVM host (Option A) |
@@ -355,11 +356,7 @@ Issues actually hit during onboarding, with root causes and fixes:
 Rough edges in the current scripts that surfaced during onboarding review;
 fixes welcome:
 
-- **KVM probe requires host permission changes.** The `/dev/kvm` probe in
-  `hack/create-kind-cluster.sh` runs an unprivileged container, so users must
-  `chmod`/group-modify the host device first. The probe should instead run as
-  a root container so no host mutation is needed.
-- **Micro-VM asset staging requires the `aws` CLI on the host.**
+- **microVM asset staging requires the `aws` CLI on the host.**
   `hack/microvm-assets/stage-to-rustfs.sh` should run the AWS CLI via Docker
   (or an equivalent in-cluster job) rather than requiring a host install.
 
