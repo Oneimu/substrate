@@ -292,6 +292,11 @@ func (a *AgentClient) StartOverlayWorkload(ctx context.Context, cid, workloadID,
 	upper := upperBase + "/fs"
 	work := upperBase + "/work"
 
+	options := []string{"lowerdir=" + lower, "upperdir=" + upper, "workdir=" + work}
+	if strings.HasPrefix(upperBase, guestUpperDiskDir) {
+		options = append(options, "index=off", "metacopy=off", "userxattr")
+	}
+
 	storages := []*agentpb.Storage{
 		{
 			Driver:     virtioFSDriver,
@@ -306,7 +311,7 @@ func (a *AgentClient) StartOverlayWorkload(ctx context.Context, cid, workloadID,
 			Fstype:        "overlay",
 			MountPoint:    ovlRoot,
 			DriverOptions: []string{createDir + "=" + upper, createDir + "=" + work},
-			Options:       []string{"lowerdir=" + lower, "upperdir=" + upper, "workdir=" + work},
+			Options:       options,
 		},
 	}
 	pbSpec := SpecToAgentPB(spec)

@@ -51,12 +51,19 @@ import (
 	"google.golang.org/grpc/reflection"
 )
 
+func getRootfsWritesDefault() string {
+	if val := os.Getenv("ATEOM_ROOTFS_WRITES"); val != "" {
+		return val
+	}
+	return "memory"
+}
+
 var (
 	podUID       = flag.String("pod-uid", "", "The UID of the current pod")
 	chBinary     = flag.String("cloud-hypervisor-binary", "cloud-hypervisor", "Path to the cloud-hypervisor binary (used to relaunch on restore).")
 	kataConfig   = flag.String("kata-config", "", "Path to a kata configuration.toml (passed to the shim as KATA_CONF_FILE). Empty uses kata's default. atelet generates one pointing at runtime-fetched assets.")
 	kataDebug    = flag.Bool("kata-debug", false, "Verbose kata-agent debugging: raise the guest agent log level and forward the guest console (incl. agent logs) into the pod logs.")
-	rootfsWrites = flag.String("rootfs-writes", "memory", "Where each container's overlay rootfs upper lives: \"memory\" (guest tmpfs: RAM-speed writes that ride in the memory snapshot, but every rootfs write is guest RAM) or \"disk\" (a host-disk-backed virtio-fs share: guest RAM and snapshots stay lean at the cost of virtio-fs write latency). Applies to cold boots; restores follow the snapshot they restore.")
+	rootfsWrites = flag.String("rootfs-writes", getRootfsWritesDefault(), "Where each container's overlay rootfs upper lives: \"memory\" (guest tmpfs: RAM-speed writes that ride in the memory snapshot, but every rootfs write is guest RAM) or \"disk\" (a host-disk-backed virtio-fs share: guest RAM and snapshots stay lean at the cost of virtio-fs write latency). Applies to cold boots; restores follow the snapshot they restore.")
 	showVersion  = flag.Bool("version", false, "Print version and exit.")
 	logLevelFlag = flag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
 

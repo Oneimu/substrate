@@ -145,8 +145,8 @@ func writeTree(ctx context.Context, tw *tar.Writer, srcDir string) error {
 			}
 			return copyFileInto(tw, path)
 
-		case d.IsDir(), info.Mode()&os.ModeSymlink != 0, info.Mode()&os.ModeNamedPipe != 0:
-			// FileInfoHeader already gave a FIFO Typeflag TypeFifo and size 0.
+		case d.IsDir(), info.Mode()&os.ModeSymlink != 0, info.Mode()&os.ModeNamedPipe != 0, info.Mode()&os.ModeDevice != 0:
+			// FileInfoHeader already populated directory, symlink, FIFO, or device Typeflags.
 			return tw.WriteHeader(hdr)
 
 		default:
@@ -283,6 +283,15 @@ func extractEntry(root *os.Root, tr *tar.Reader, hdr *tar.Header, name string, d
 			return fmt.Errorf("creating hardlink %q -> %q: %w", name, target, err)
 		}
 		return nil
+
+	case tar.TypeChar, tar.TypeBlock:
+		if err := replaceExisting(root, name); err != nil {
+			return err
+		}
+		if err := createDevice(root, name, hdr, mode); err != nil {
+			return err
+		}
+		return restoreMeta(root, name, hdr)
 
 	default:
 		return fmt.Errorf("unsupported tar entry type %q at %q", string([]byte{hdr.Typeflag}), name)

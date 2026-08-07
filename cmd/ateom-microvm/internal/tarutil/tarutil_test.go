@@ -90,6 +90,12 @@ func TestRoundTrip(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(src, "empty"), 0o755); err != nil {
 		t.Fatalf("mkdir empty: %v", err)
 	}
+	// Chmod explicitly: the Mkdir mode is clipped by the process umask (0o750
+	// under the 027 some workstations default to), which would skew the mode
+	// the round-trip below is expected to preserve.
+	if err := os.Chmod(filepath.Join(src, "empty"), 0o755); err != nil {
+		t.Fatalf("chmod empty: %v", err)
+	}
 	if err := os.Symlink("a.txt", filepath.Join(src, "link")); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
@@ -360,7 +366,7 @@ func TestRoundTripOwnership(t *testing.T) {
 	}
 }
 
-func TestCreateRejectsDeviceNode(t *testing.T) {
+func TestCreateSupportsDeviceNode(t *testing.T) {
 	roottest.Require(t, "creating a device node requires root")
 
 	src := t.TempDir()
@@ -368,12 +374,23 @@ func TestCreateRejectsDeviceNode(t *testing.T) {
 	if err := unix.Mknod(filepath.Join(src, "null"), unix.S_IFCHR|0o666, int(unix.Mkdev(1, 3))); err != nil {
 		t.Fatalf("creating device node: %v", err)
 	}
-	err := Create(t.Context(), filepath.Join(t.TempDir(), "dev.tar"), src)
-	if err == nil {
-		t.Fatal("Create succeeded on a device node, want an error")
+	tarPath := filepath.Join(t.TempDir(), "dev.tar")
+	err := Create(t.Context(), tarPath, src)
+	if err != nil {
+		t.Fatalf("Create failed on a device node: %v", err)
 	}
-	if !strings.Contains(err.Error(), "unsupported file type") {
-		t.Errorf("error = %v, want it to mention an unsupported file type", err)
+
+	dst := t.TempDir()
+	if err := Extract(tarPath, dst); err != nil {
+		t.Fatalf("Extract failed on a device entry: %v", err)
+	}
+
+	st, err := os.Lstat(filepath.Join(dst, "null"))
+	if err != nil {
+		t.Fatalf("stat on extracted device: %v", err)
+	}
+	if st.Mode()&os.ModeDevice == 0 || st.Mode()&os.ModeCharDevice == 0 {
+		t.Errorf("extracted node mode = %v, want character device", st.Mode())
 	}
 }
 
@@ -490,10 +507,21 @@ func TestExtractIntoPrecreatedVolumeDir(t *testing.T) {
 	}
 }
 
-func TestExtractRejectsUnsupportedType(t *testing.T) {
+func TestExtractSupportsDeviceType(t *testing.T) {
+	roottest.Require(t, "creating a device node requires root")
+
 	tarPath := filepath.Join(t.TempDir(), "dev.tar")
 	writeTar(t, tarPath, tar.Header{Name: "null", Typeflag: tar.TypeChar, Devmajor: 1, Devminor: 3})
-	if err := Extract(tarPath, t.TempDir()); err == nil {
-		t.Fatal("Extract succeeded on a device entry, want an error")
+	dst := t.TempDir()
+	if err := Extract(tarPath, dst); err != nil {
+		t.Fatalf("Extract failed on a device entry: %v", err)
+	}
+
+	st, err := os.Lstat(filepath.Join(dst, "null"))
+	if err != nil {
+		t.Fatalf("stat on extracted device: %v", err)
+	}
+	if st.Mode()&os.ModeDevice == 0 || st.Mode()&os.ModeCharDevice == 0 {
+		t.Errorf("extracted node mode = %v, want character device", st.Mode())
 	}
 }

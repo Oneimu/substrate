@@ -15,6 +15,8 @@
 package tarutil
 
 import (
+	"archive/tar"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,6 +45,35 @@ func createFifo(root *os.Root, name string, mode os.FileMode) error {
 
 	if err := unix.Mkfifoat(int(parent.Fd()), base, uint32(mode.Perm())); err != nil {
 		return fmt.Errorf("creating fifo %q: %w", name, err)
+	}
+	return nil
+}
+
+// createDevice creates a character or block device node relative to root.
+func createDevice(root *os.Root, name string, hdr *tar.Header, mode os.FileMode) error {
+	dir, base := filepath.Split(name)
+	if dir == "" {
+		dir = "."
+	}
+	parent, err := root.Open(filepath.Clean(dir))
+	if err != nil {
+		return fmt.Errorf("opening parent directory of %q: %w", name, err)
+	}
+	defer parent.Close()
+
+	var flags uint32
+	if hdr.Typeflag == tar.TypeChar {
+		flags = unix.S_IFCHR
+	} else {
+		flags = unix.S_IFBLK
+	}
+
+	dev := unix.Mkdev(uint32(hdr.Devmajor), uint32(hdr.Devminor))
+	if err := unix.Mknodat(int(parent.Fd()), base, flags|uint32(mode.Perm()), int(dev)); err != nil {
+		if errors.Is(err, os.ErrPermission) && os.Geteuid() != 0 {
+			return nil
+		}
+		return fmt.Errorf("creating device %q: %w", name, err)
 	}
 	return nil
 }
