@@ -203,6 +203,15 @@ func (a *AgentClient) AddARPNeighbors(ctx context.Context, neighbors []*agentpb.
 	return nil
 }
 
+// ExecProcess executes a process inside a container or sandbox via the agent.
+// Mirrors grpc.AgentService/ExecProcess (returns google.protobuf.Empty).
+func (a *AgentClient) ExecProcess(ctx context.Context, req *agentpb.ExecProcessRequest) error {
+	if err := a.client.Call(ctx, "grpc.AgentService", "ExecProcess", req, &emptypb.Empty{}); err != nil {
+		return fmt.Errorf("agent ExecProcess: %w", err)
+	}
+	return nil
+}
+
 // ReadStdout reads up to max bytes from the container process's stdout. It is a
 // unary RPC (NOT a server stream): each call returns whatever bytes the agent has
 // buffered (up to max), so callers loop until it returns an error — the agent

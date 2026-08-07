@@ -39,6 +39,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // Create writes a tar archive of srcDir's contents to tarPath. Entry names are
@@ -127,6 +129,20 @@ func writeTree(ctx context.Context, tw *tar.Writer, srcDir string) error {
 		}
 		setOwner(hdr, info)
 
+		// Read user.* xattrs and populate PAXRecords
+		xattrs, err := getLsetxattrs(path)
+		if err != nil {
+			return fmt.Errorf("reading xattrs for %q: %w", path, err)
+		}
+		if len(xattrs) > 0 {
+			if hdr.PAXRecords == nil {
+				hdr.PAXRecords = make(map[string]string)
+			}
+			for name, val := range xattrs {
+				hdr.PAXRecords["SCHILY.xattr."+name] = val
+			}
+		}
+
 		switch {
 		case info.Mode().IsRegular():
 			// A second link to an already-archived inode: record the link and
@@ -214,15 +230,15 @@ func Extract(tarPath, dstDir string) error {
 		if skip {
 			continue
 		}
-		if err := extractEntry(root, tr, hdr, name, dirs); err != nil {
+		if err := extractEntry(dstDir, root, tr, hdr, name, dirs); err != nil {
 			return err
 		}
 	}
-	return restoreDirMeta(root, dirs)
+	return restoreDirMeta(dstDir, root, dirs)
 }
 
 // extractEntry materializes one archive entry under root.
-func extractEntry(root *os.Root, tr *tar.Reader, hdr *tar.Header, name string, dirs map[string]*tar.Header) error {
+func extractEntry(dstDir string, root *os.Root, tr *tar.Reader, hdr *tar.Header, name string, dirs map[string]*tar.Header) error {
 	mode := hdr.FileInfo().Mode().Perm()
 
 	switch hdr.Typeflag {
@@ -249,7 +265,7 @@ func extractEntry(root *os.Root, tr *tar.Reader, hdr *tar.Header, name string, d
 		if closeErr != nil {
 			return fmt.Errorf("closing %q: %w", name, closeErr)
 		}
-		return restoreMeta(root, name, hdr)
+		return restoreMeta(dstDir, root, name, hdr)
 
 	case tar.TypeSymlink:
 		if err := replaceExisting(root, name); err != nil {
@@ -269,7 +285,7 @@ func extractEntry(root *os.Root, tr *tar.Reader, hdr *tar.Header, name string, d
 		if err := createFifo(root, name, mode); err != nil {
 			return err
 		}
-		return restoreMeta(root, name, hdr)
+		return restoreMeta(dstDir, root, name, hdr)
 
 	case tar.TypeLink:
 		target, skip, err := cleanTarName(hdr.Linkname)
@@ -291,7 +307,7 @@ func extractEntry(root *os.Root, tr *tar.Reader, hdr *tar.Header, name string, d
 		if err := createDevice(root, name, hdr, mode); err != nil {
 			return err
 		}
-		return restoreMeta(root, name, hdr)
+		return restoreMeta(dstDir, root, name, hdr)
 
 	default:
 		return fmt.Errorf("unsupported tar entry type %q at %q", string([]byte{hdr.Typeflag}), name)
@@ -318,14 +334,14 @@ func replaceExisting(root *os.Root, name string) error {
 // directories, deepest first: a directory's path is always longer than its
 // parent's, so length-descending order restores children before the parent's
 // mode can make them unreachable.
-func restoreDirMeta(root *os.Root, dirs map[string]*tar.Header) error {
+func restoreDirMeta(dstDir string, root *os.Root, dirs map[string]*tar.Header) error {
 	names := make([]string, 0, len(dirs))
 	for name := range dirs {
 		names = append(names, name)
 	}
 	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
 	for _, name := range names {
-		if err := restoreMeta(root, name, dirs[name]); err != nil {
+		if err := restoreMeta(dstDir, root, name, dirs[name]); err != nil {
 			return err
 		}
 	}
@@ -349,7 +365,7 @@ func restoredMode(hdr *tar.Header) os.FileMode {
 // restoreMeta applies ownership, mode, and modification time to an extracted
 // path. Ownership is applied first because chowning a file clears its setuid
 // and setgid bits, which the chmod below then puts back.
-func restoreMeta(root *os.Root, name string, hdr *tar.Header) error {
+func restoreMeta(dstDir string, root *os.Root, name string, hdr *tar.Header) error {
 	if err := lchownEntry(root, name, hdr); err != nil {
 		return err
 	}
@@ -361,6 +377,18 @@ func restoreMeta(root *os.Root, name string, hdr *tar.Header) error {
 			return fmt.Errorf("restoring times on %q: %w", name, err)
 		}
 	}
+
+	// Restore user.* extended attributes from PAXRecords
+	for k, v := range hdr.PAXRecords {
+		if strings.HasPrefix(k, "SCHILY.xattr.user.") {
+			attrName := strings.TrimPrefix(k, "SCHILY.xattr.")
+			hostPath := filepath.Join(dstDir, name)
+			if err := unix.Lsetxattr(hostPath, attrName, []byte(v), 0); err != nil {
+				return fmt.Errorf("restoring xattr %q on %q: %w", attrName, hostPath, err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -380,4 +408,46 @@ func cleanTarName(name string) (cleaned string, skip bool, err error) {
 		return "", false, fmt.Errorf("not a local path: %q", name)
 	}
 	return cleaned, false, nil
+}
+
+// getLsetxattrs lists and reads user.* extended attributes of path on Linux.
+func getLsetxattrs(path string) (map[string]string, error) {
+	sz, err := unix.Llistxattr(path, nil)
+	if err != nil {
+		if errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.ENOSYS) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if sz <= 0 {
+		return nil, nil
+	}
+	buf := make([]byte, sz)
+	sz, err = unix.Llistxattr(path, buf)
+	if err != nil {
+		return nil, err
+	}
+
+	xattrs := make(map[string]string)
+	names := strings.Split(string(buf[:sz]), "\x00")
+	for _, name := range names {
+		if name == "" || !strings.HasPrefix(name, "user.") {
+			continue
+		}
+		vsz, err := unix.Lgetxattr(path, name, nil)
+		if err != nil {
+			return nil, err
+		}
+		if vsz <= 0 {
+			xattrs[name] = ""
+			continue
+		}
+		vbuf := make([]byte, vsz)
+		vsz, err = unix.Lgetxattr(path, name, vbuf)
+		if err != nil {
+			return nil, err
+		}
+		xattrs[name] = string(vbuf[:vsz])
+	}
+	return xattrs, nil
 }

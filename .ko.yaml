@@ -20,6 +20,7 @@ defaultPlatforms:
 
 baseImageOverrides:
   github.com/agent-substrate/substrate/demos/sandbox: alpine
+  github.com/agent-substrate/substrate/demos/counter: alpine
   # ateom-microvm needs glibc (for the fetched cloud-hypervisor binary) and mount/umount
   # (to bind the image into the virtiofsd shared dir) — both in debian:stable-slim but
   # not in the distroless static default.

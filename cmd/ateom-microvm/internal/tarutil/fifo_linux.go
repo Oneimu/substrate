@@ -16,7 +16,6 @@ package tarutil
 
 import (
 	"archive/tar"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -70,9 +69,6 @@ func createDevice(root *os.Root, name string, hdr *tar.Header, mode os.FileMode)
 
 	dev := unix.Mkdev(uint32(hdr.Devmajor), uint32(hdr.Devminor))
 	if err := unix.Mknodat(int(parent.Fd()), base, flags|uint32(mode.Perm()), int(dev)); err != nil {
-		if errors.Is(err, os.ErrPermission) && os.Geteuid() != 0 {
-			return nil
-		}
 		return fmt.Errorf("creating device %q: %w", name, err)
 	}
 	return nil
