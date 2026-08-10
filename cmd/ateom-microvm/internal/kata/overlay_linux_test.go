@@ -17,15 +17,36 @@
 package kata
 
 import (
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
+
+// The kernel requires overlay upperdir and workdir on the same filesystem and
+// rejects a workdir nested inside (or equal to) upperdir — so they must be
+// SIBLINGS under the one upper base on the ateUpper share. A layout change
+// here breaks every overlay mount.
+func TestUpperWorkDirsAreSiblings(t *testing.T) {
+	base := UpperBase("app")
+	upper, work := upperWorkDirs(base)
+	if filepath.Dir(upper) != base || filepath.Dir(work) != base {
+		t.Errorf("upperWorkDirs(%q) = %q, %q; want both directly under the base", base, upper, work)
+	}
+	if upper == work {
+		t.Errorf("upperWorkDirs(%q): upper and work are the same directory %q", base, upper)
+	}
+	if strings.HasPrefix(work+"/", upper+"/") {
+		t.Errorf("upperWorkDirs(%q): work %q is nested inside upper %q", base, work, upper)
+	}
+}
 
 func TestVirtiofsdArgs(t *testing.T) {
 	tests := []struct {
 		name      string
 		opts      VirtiofsdOptions
 		wantCache string
+		wantXattr bool
 	}{
 		{
 			name:      "RO lower defaults to cache=always",
@@ -41,12 +62,29 @@ func TestVirtiofsdArgs(t *testing.T) {
 			},
 			wantCache: "--cache=auto",
 		},
+		{
+			name: "rootfs upper share passes xattrs through",
+			opts: VirtiofsdOptions{
+				SocketPath: "/run/vm/virtiofsd-upper.sock",
+				SharedDir:  "/var/lib/ateom-gvisor/actors/uid/rootfs-upper",
+				Cache:      "auto",
+				Xattr:      true,
+			},
+			wantCache: "--cache=auto",
+			wantXattr: true,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			args := virtiofsdArgs(tc.opts)
 			if !slices.Contains(args, tc.wantCache) {
 				t.Errorf("args %v do not contain %q", args, tc.wantCache)
+			}
+			// Overlay whiteouts/opaque markers are user.overlay.* xattrs in the
+			// upper; a share hosting an upper must pass them through, and the
+			// others must not pay the passthrough cost.
+			if gotXattr := slices.Contains(args, "--xattr"); gotXattr != tc.wantXattr {
+				t.Errorf("args %v: --xattr present = %v, want %v", args, gotXattr, tc.wantXattr)
 			}
 			for _, want := range []string{
 				"--socket-path=" + tc.opts.SocketPath,

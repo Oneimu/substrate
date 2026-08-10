@@ -211,6 +211,19 @@ func DurableDirVolumeMountPoint(actorUID, volumeName string) string {
 	)
 }
 
+// RootfsUpperDir is the host directory backing the actor's rootfs overlay
+// uppers in ateom-microvm: one subdirectory per container, served into the
+// guest over virtio-fs so rootfs writes land on host disk instead of guest
+// RAM. Unlike the durable-dir volumes it is owned entirely by ateom (created
+// at cold boot, archived at checkpoint, removed at teardown); atelet never
+// touches it.
+func RootfsUpperDir(actorUID string) string {
+	return filepath.Join(
+		ActorPath(actorUID),
+		"rootfs-upper",
+	)
+}
+
 // RestoreStateDir is the local directory to use to restore an actor from a
 // checkpoint downloaded from GCS.
 //

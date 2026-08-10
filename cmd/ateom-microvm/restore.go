@@ -155,15 +155,16 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 // restoreFullScope restores a whole-guest snapshot: relaunch cloud-hypervisor
 // directly from it and resume.
 //
-// Each container's rootfs is overlay(virtio-fs RO lower + guest-tmpfs upper). Steps:
+// Each container's rootfs is overlay(virtio-fs RO lower + disk-backed upper). Steps:
 // reconstruct each RO lower from the local OCI bundle (atelet re-unpacked the golden
 // image) at the frozen find-paths path and start the virtiofsd serving them; rewrite
 // the snapshot config's per-VMDir paths (vsock + serial + fs sockets) to this actor's;
 // rebuild the tap (the snapshot's virtio-net is fd-backed → fresh net_fds); relaunch
-// CH with --restore (OnDemand), and resume. Guest RAM — incl. the actor's in-memory
-// state, the tmpfs rootfs upper (so rootfs writes PERSIST), and the frozen network
-// config — comes back from the memory snapshot. Durable-dir volumes are host-backed
-// instead, and the caller has already restored them from the snapshot's tar.
+// CH with --restore (OnDemand), and resume. Guest RAM — the actor's in-memory state
+// and the frozen network config — comes back from the memory snapshot. The rootfs
+// uppers and durable-dir volumes are host-backed: the durable volumes were restored
+// by the caller from their tar, and the rootfs uppers are re-materialized from
+// rootfs-upper.tar below (in the background, overlapped with the setup here).
 func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, restoreDir string, tStart time.Time) (retErr error) {
 	actorUID := p.actorUID
 	templateNS, templateName := p.templateNS, p.templateName
@@ -190,14 +191,39 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 		return fmt.Errorf("while creating VM dir: %w", err)
 	}
 
+	// Disk-backed rootfs uppers: the snapshot says whether the guest expects the
+	// ateUpper share (its config.json references the fs device and the tar rides
+	// alongside). Start re-materializing the upper contents NOW, in the
+	// background: the untar scales with the actor's data and depends on nothing
+	// below, so it hides behind the lower staging, network, and tap setup and is
+	// joined right before the share's virtiofsd starts (the guest must never
+	// observe the directory mid-restore). Legacy tmpfs-upper snapshots have no
+	// tar and skip all of this — their upper rides inside the restored guest
+	// memory.
+	//
+	// An error return between here and the join MUST drain the goroutine (the
+	// deferred receive below): returning with the untar still writing would let
+	// a retried restore's own untar race it inside the same directory.
+	hasUpper := snapshotHasRootfsUpper(restoreDir)
+	untarDone := make(chan error, 1)
+	untarJoined := false
+	if hasUpper {
+		go func() {
+			untarDone <- untarRootfsUpper(ateompath.RootfsUpperDir(actorUID), restoreDir)
+		}()
+		defer func() {
+			if !untarJoined {
+				<-untarDone
+			}
+		}()
+	}
+
 	// Reconstruct each container's overlay RO lower from the LOCAL OCI bundle (atelet
 	// re-unpacked the golden image; the lower is the immutable golden image) at the
 	// frozen find-paths location SharedDir(id)/<cid>/rootfs, and start the one virtiofsd
-	// serving them. The writable upper is a guest tmpfs restored from the memory
-	// snapshot (rootfs writes persist), so there is no disk to rebuild or repoint; the
-	// fs socket in the snapshot config is repointed to this VMDir by
-	// rewriteSnapshotSocketPaths above. cross-node consistency relies on a deterministic
-	// unpack of the same image at the same <cid>/rootfs path.
+	// serving them. The fs sockets in the snapshot config are repointed to this VMDir
+	// by rewriteSnapshotSocketPaths above. cross-node consistency relies on a
+	// deterministic unpack of the same image at the same <cid>/rootfs path.
 	containers := p.containers
 	if len(containers) == 0 {
 		return status.Error(codes.InvalidArgument, "actor spec has no containers")
@@ -296,6 +322,28 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 		restoredNets = append(restoredNets, rn)
 	}
 
+	// Join the background untar and serve the re-materialized uppers exactly
+	// like the durable share — the tar reproduces the paths find-paths re-opens.
+	// Staged as late as possible (CH first needs the socket at Restore below) so
+	// the untar hid behind all of the setup above.
+	var upperVfsdCmd *exec.Cmd
+	if hasUpper {
+		untarErr := <-untarDone
+		untarJoined = true
+		if untarErr != nil {
+			return untarErr
+		}
+		if upperVfsdCmd, err = s.stageRootfsUpperShare(ctx, rr, actorUID); err != nil {
+			return err
+		}
+		defer func() {
+			if retErr != nil && upperVfsdCmd.Process != nil {
+				_ = upperVfsdCmd.Process.Kill()
+				_, _ = upperVfsdCmd.Process.Wait()
+			}
+		}()
+	}
+
 	// Relaunch CH and restore with the tap FDs attached (SCM_RIGHTS). CH reopens
 	// /dev/vda (image) + each /dev/vd{b+i} (actor rootfs) from the snapshot config paths.
 	apiSocket := filepath.Join(kata.VMDir(actorUID), "clh-api-restore.sock")
@@ -351,7 +399,7 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	}
 
 	ra := &runningActor{
-		chCmd: chCmd, vfsdCmd: vfsdCmd, durableVfsdCmd: durableVfsdCmd,
+		chCmd: chCmd, vfsdCmd: vfsdCmd, durableVfsdCmd: durableVfsdCmd, upperVfsdCmd: upperVfsdCmd,
 		apiSocket: apiSocket, baseID: srcID, restoreSourceDir: restoreDir,
 		snapshotIsSelfContained: memMode == ch.MemRestoreEager,
 	}
@@ -428,8 +476,8 @@ func rewriteSnapshotSocketPaths(snapshotDir, id string) error {
 	// Each virtio-fs share is served by its own per-VMDir virtiofsd socket; the
 	// snapshot recorded the golden actor's, so repoint them at this actor's VMDir.
 	// Match on the device tag: the shares have separate sockets (the overlay RO
-	// lower's and, when the actor has durable-dir volumes, the writable share's), and
-	// crossing them would hand the guest the wrong filesystem.
+	// lower's and, when present, the writable durable-dir and rootfs upper shares'),
+	// and crossing them would hand the guest the wrong filesystem.
 	if fss, ok := cfg["fs"].([]any); ok {
 		for _, f := range fss {
 			fm, ok := f.(map[string]any)
@@ -441,6 +489,8 @@ func rewriteSnapshotSocketPaths(snapshotDir, id string) error {
 				fm["socket"] = kata.VirtiofsdSocketPath(id)
 			case kata.DurableFsTag:
 				fm["socket"] = kata.DurableVirtiofsdSocketPath(id)
+			case kata.UpperFsTag:
+				fm["socket"] = kata.UpperVirtiofsdSocketPath(id)
 			default:
 				return fmt.Errorf("snapshot config %q has fs device with unknown tag %q", cfgPath, tag)
 			}

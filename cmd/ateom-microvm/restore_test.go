@@ -86,26 +86,31 @@ func TestRewriteSnapshotSocketPaths(t *testing.T) {
 	})
 
 	t.Run("each share keeps its own socket", func(t *testing.T) {
-		// Ordered durable-first to catch a rewrite that assumes the RO lower comes
+		// Ordered with the RO lower last to catch a rewrite that assumes it comes
 		// first, which would hand the guest the wrong filesystem.
 		dir := writeSnapshotConfig(t, []map[string]any{
 			{"tag": kata.DurableFsTag, "socket": "/run/vc/vm/golden/virtiofsd-durable.sock"},
+			{"tag": kata.UpperFsTag, "socket": "/run/vc/vm/golden/virtiofsd-upper.sock"},
 			{"tag": kata.FsTag, "socket": "/run/vc/vm/golden/virtiofsd.sock"},
 		})
 		if err := rewriteSnapshotSocketPaths(dir, id); err != nil {
 			t.Fatalf("rewriteSnapshotSocketPaths: %v", err)
 		}
 		got := readFsSockets(t, dir)
-		for tag, want := range map[string]string{
+		want := map[string]string{
 			kata.FsTag:        kata.VirtiofsdSocketPath(id),
 			kata.DurableFsTag: kata.DurableVirtiofsdSocketPath(id),
-		} {
-			if got[tag] != want {
-				t.Errorf("%s socket = %q, want %q", tag, got[tag], want)
-			}
+			kata.UpperFsTag:   kata.UpperVirtiofsdSocketPath(id),
 		}
-		if got[kata.FsTag] == got[kata.DurableFsTag] {
-			t.Error("both shares were pointed at the same socket")
+		seen := map[string]string{}
+		for tag, w := range want {
+			if got[tag] != w {
+				t.Errorf("%s socket = %q, want %q", tag, got[tag], w)
+			}
+			if prev, dup := seen[got[tag]]; dup {
+				t.Errorf("shares %s and %s were pointed at the same socket %q", prev, tag, got[tag])
+			}
+			seen[got[tag]] = tag
 		}
 	})
 
