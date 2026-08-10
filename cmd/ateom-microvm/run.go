@@ -66,6 +66,10 @@ type runningActor struct {
 	// durable-dir volumes. nil when the actor declares none. Owned and torn down
 	// exactly like vfsdCmd.
 	durableVfsdCmd *exec.Cmd
+	// upperVfsdCmd is the third virtiofsd, serving the actor's disk-backed
+	// rootfs uppers (see rootfsupper.go). nil only for a legacy actor restored
+	// from a tmpfs-upper snapshot. Owned and torn down exactly like vfsdCmd.
+	upperVfsdCmd *exec.Cmd
 	// apiSocket is the CH api-socket for this ateom-owned VMM.
 	apiSocket string
 
@@ -125,7 +129,7 @@ func overlayWorkloadID(name string) string { return name + "_ovl" }
 // actorContainer is one of the actor's containers prepared for the shared micro-VM:
 // its name (also the kata containerID + the overlay lower's find-paths subdir), the
 // host OCI bundle rootfs that backs the RO lower, and its OCI spec. The writable
-// overlay upper is a guest tmpfs (OverlayUpperBase(name)), so there is no host disk.
+// overlay upper is a directory on the disk-backed ateUpper share (kata.UpperBase(name)).
 type actorContainer struct {
 	name         string
 	bundleRootfs string
@@ -188,8 +192,8 @@ func writeGuestResolvConf(rootfs string) error {
 // RunWorkload boots the actor as a cloud-hypervisor micro-VM and starts its containers.
 //
 // ateom boots cloud-hypervisor directly (no kata shim) and gives each container an
-// overlay rootfs: its OCI image read-only over virtio-fs (the lower) plus a guest
-// tmpfs (the writable upper). It drives the kata clh boot (vm.create kernel+image+fs,
+// overlay rootfs: its OCI image read-only over virtio-fs (the lower) plus a writable
+// upper on the disk-backed ateUpper share. It drives the kata clh boot (vm.create kernel+image+fs,
 // add-net, vm.boot) and the post-boot setup the shim would otherwise do (agent
 // CreateSandbox + guest network config) before having the kata-agent assemble and
 // start each container.
@@ -354,7 +358,7 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	}()
 
 	// Prepare each container's OCI spec + record its bundle rootfs (the overlay RO
-	// lower). No host disk — the rootfs is overlay(virtio-fs lower + guest-tmpfs upper).
+	// lower). The rootfs is overlay(virtio-fs RO lower + disk-backed ateUpper upper).
 	ctrs, err := s.buildActorContainers(actorUID, containers)
 	if err != nil {
 		return err
@@ -403,6 +407,23 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 		}()
 	}
 
+	// Disk-backed rootfs uppers: a third writable virtio-fs share, served from
+	// a per-actor host directory ateom prepares itself (pristine — a cold boot
+	// starts from the bare image). See rootfsupper.go.
+	if err := resetRootfsUpperDir(actorUID); err != nil {
+		return err
+	}
+	upperVfsdCmd, err := s.stageRootfsUpperShare(ctx, rr, actorUID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if retErr != nil && upperVfsdCmd.Process != nil {
+			_ = upperVfsdCmd.Process.Kill()
+			_, _ = upperVfsdCmd.Process.Wait()
+		}
+	}()
+
 	// Launch a bare VMM (CH + api-socket); ateom owns this process for teardown.
 	apiSocket := filepath.Join(kata.VMDir(actorUID), "clh-api.sock")
 	chCmd, client, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
@@ -422,8 +443,8 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	}()
 
 	// Assemble the CH VmConfig (kata-compatible cmdline, RO kata image on /dev/vda +
-	// the virtio-fs device for the overlay RO lower; no actor virtio-blk disks — the
-	// writable upper is a guest tmpfs). serialLog is also read on a failed agent dial
+	// the virtio-fs devices; no actor virtio-blk disks — the writable upper is the
+	// disk-backed ateUpper share). serialLog is also read on a failed agent dial
 	// below, so keep it here.
 	serialLog := filepath.Join(kata.VMDir(actorUID), "serial.log")
 	vmCfg := buildVMConfig(actorUID, kernel, image, kparams, serialLog, memMiB, vcpus, durable)
@@ -489,7 +510,7 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 		return fmt.Errorf("while waiting for container readyz: %w", err)
 	}
 
-	ra := &runningActor{chCmd: chCmd, vfsdCmd: vfsdCmd, durableVfsdCmd: durableVfsdCmd, apiSocket: apiSocket, baseID: actorUID, logAgent: ac}
+	ra := &runningActor{chCmd: chCmd, vfsdCmd: vfsdCmd, durableVfsdCmd: durableVfsdCmd, upperVfsdCmd: upperVfsdCmd, apiSocket: apiSocket, baseID: actorUID, logAgent: ac}
 	if err := s.activateActorNetworking(p.actorRef.Atespace, p.actorRef.Name, egress); err != nil {
 		return err
 	}
@@ -509,9 +530,9 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 // buildActorContainers prepares each of the actor's containers for the shared
 // micro-VM: it loads the OCI spec from the per-container bundle, injects guest DNS,
 // and records the bundle rootfs that backs the overlay's RO lower. No host disk is
-// built — the rootfs is overlay(virtio-fs RO lower + guest-tmpfs upper); the lowers
-// are bound into virtiofsd's shared dir in stageOverlayLowers after the sandbox state
-// is clean. Both RunWorkload and RestoreWorkload go through here.
+// prepared here — the rootfs is overlay(virtio-fs RO lower + ateUpper upper); the
+// lowers are bound into virtiofsd's shared dir in stageOverlayLowers after the sandbox
+// state is clean. Both RunWorkload and RestoreWorkload go through here.
 func (s *AteomService) buildActorContainers(actorUID string, containers []*ateompb.Container) ([]actorContainer, error) {
 	netnsPath := ateompath.AteomNetNSPath(s.podUID)
 	ctrs := make([]actorContainer, len(containers))
@@ -527,7 +548,7 @@ func (s *AteomService) buildActorContainers(actorUID string, containers []*ateom
 		// overlay spec). Everything downstream — the resolv.conf write below,
 		// the bind into virtiofsd's shared dir, the read-only remount — then
 		// sees the composed tree, with host-side writes landing in the bundle's
-		// private upper. The guest still builds its own tmpfs upper on top.
+		// private upper. The guest still builds its own writable upper on top.
 		if err := imagecache.SetupBundleRootfs(bundle); err != nil {
 			return nil, fmt.Errorf("while composing rootfs for %q: %w", cn, err)
 		}
@@ -602,6 +623,7 @@ func (s *AteomService) guestConfig(rr resolvedRuntime) (memMiB, vcpus int, kpara
 //
 // withDurable adds a second virtio-fs device for the actor's writable durable-dir
 // volumes (see durable.go), served by its own virtiofsd on the same PCI segment.
+// The disk-backed rootfs upper share (see rootfsupper.go) is always present.
 func buildVMConfig(id, kernel, image, kparams, serialLog string, memMiB, vcpus int, withDurable bool) ch.VmConfig {
 	console := "ttyS0"
 	if runtime.GOARCH == "arm64" {
@@ -629,13 +651,21 @@ func buildVMConfig(id, kernel, image, kparams, serialLog string, memMiB, vcpus i
 }
 
 // buildFsConfigs returns the VM's virtio-fs devices: the overlay RO lower's
-// share, plus the writable durable-dir share when the actor has one. Both sit on
-// PCI segment 1 (the segment buildVMConfig reserves for virtio-fs).
+// share, the writable disk-backed rootfs upper share (always present — every
+// container's overlay upper lives on it), plus the writable durable-dir share
+// when the actor has one. All sit on PCI segment 1 (the segment buildVMConfig
+// reserves for virtio-fs).
 func buildFsConfigs(id string, withDurable bool) []ch.FsConfig {
-	fs := []ch.FsConfig{{
-		Tag: kata.FsTag, Socket: kata.VirtiofsdSocketPath(id),
-		NumQueues: 1, QueueSize: 1024, PciSegment: 1,
-	}}
+	fs := []ch.FsConfig{
+		{
+			Tag: kata.FsTag, Socket: kata.VirtiofsdSocketPath(id),
+			NumQueues: 1, QueueSize: 1024, PciSegment: 1,
+		},
+		{
+			Tag: kata.UpperFsTag, Socket: kata.UpperVirtiofsdSocketPath(id),
+			NumQueues: 1, QueueSize: 1024, PciSegment: 1,
+		},
+	}
 	if withDurable {
 		fs = append(fs, ch.FsConfig{
 			Tag: kata.DurableFsTag, Socket: kata.DurableVirtiofsdSocketPath(id),
@@ -654,8 +684,8 @@ func buildFsConfigs(id string, withDurable bool) []ch.FsConfig {
 // the writable durable share, and each container binds the volumes it declared.
 func (s *AteomService) startActorContainers(ctx context.Context, ac *kata.AgentClient, id, vsockPath string, ctrs []actorContainer, durable bool) error {
 	// Establish the agent sandbox + the kataShared virtio-fs mount (the RO base for
-	// every container's overlay lower). All containers share it, so use the first
-	// container's hostname.
+	// every container's overlay lower) + the writable rootfs upper share. All
+	// containers share them, so use the first container's hostname.
 	sbCtx, sbCancel := context.WithTimeout(ctx, 20*time.Second)
 	err := ac.CreateSandboxForActor(sbCtx, id, ctrs[0].spec.Hostname, durable)
 	sbCancel()
@@ -683,9 +713,10 @@ func (s *AteomService) startActorContainers(ctx context.Context, ac *kata.AgentC
 }
 
 // startOverlayContainer brings up one container's rootfs as overlay(virtio-fs RO
-// lower + guest-tmpfs upper): a carrier container (id == name) eager-binds the RO base
+// lower + writable upper): a carrier container (id == name) eager-binds the RO base
 // to /run/kata-containers/<name>/rootfs, then the workload (id == <name>_ovl) overlays
-// it with a tmpfs upper. On failure it dumps the guest overlay state.
+// it with a directory on the disk-backed ateUpper share. On failure it dumps the
+// guest overlay state.
 //
 // With a durable-dir volume, the WORKLOAD also binds it at the container's declared
 // mount paths. The carrier deliberately does not: its rootfs is the read-only lower,
@@ -700,7 +731,7 @@ func startOverlayContainer(ctx context.Context, ac *kata.AgentClient, vsockPath 
 		return fmt.Errorf("while creating carrier %q: %w", c.name, err)
 	}
 
-	upperBase := kata.OverlayUpperBase(c.name)
+	upperBase := kata.UpperBase(c.name)
 	wlCtx, wlCancel := context.WithTimeout(ctx, 30*time.Second)
 	err = ac.StartOverlayWorkload(wlCtx, c.name, overlayWorkloadID(c.name), upperBase, workloadSpec(c))
 	wlCancel()
@@ -784,6 +815,7 @@ func logGuestBootDiagnostics(ctx context.Context, actorUID, serialLog string) {
 		{"serial", serialLog},
 		{"virtiofsd", virtiofsdLogPath(actorUID)},
 		{"virtiofsd-durable", durableVirtiofsdLogPath(actorUID)},
+		{"virtiofsd-upper", upperVirtiofsdLogPath(actorUID)},
 	} {
 		b, err := os.ReadFile(l.path)
 		if err != nil || len(b) == 0 {
