@@ -17,9 +17,29 @@
 package kata
 
 import (
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
+
+// The kernel requires overlay upperdir and workdir on the same filesystem and
+// rejects a workdir nested inside (or equal to) upperdir — so they must be
+// SIBLINGS under the one upper base on the ateUpper share. A layout change
+// here breaks every overlay mount.
+func TestUpperWorkDirsAreSiblings(t *testing.T) {
+	base := DiskUpperBase("app")
+	upper, work := upperWorkDirs(base)
+	if filepath.Dir(upper) != base || filepath.Dir(work) != base {
+		t.Errorf("upperWorkDirs(%q) = %q, %q; want both directly under the base", base, upper, work)
+	}
+	if upper == work {
+		t.Errorf("upperWorkDirs(%q): upper and work are the same directory %q", base, upper)
+	}
+	if strings.HasPrefix(work+"/", upper+"/") {
+		t.Errorf("upperWorkDirs(%q): work %q is nested inside upper %q", base, work, upper)
+	}
+}
 
 func TestVirtiofsdArgs(t *testing.T) {
 	tests := []struct {

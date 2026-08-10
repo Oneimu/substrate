@@ -151,6 +151,33 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 		return fmt.Errorf("while creating VM dir: %w", err)
 	}
 
+	// Disk-backed rootfs uppers: the snapshot says whether the guest expects the
+	// ateUpper share (its config.json references the fs device and the tar rides
+	// alongside). Start re-materializing the upper contents NOW, in the
+	// background: the untar scales with the actor's data and depends on nothing
+	// below, so it hides behind the lower staging, network, and tap setup and is
+	// joined right before the share's virtiofsd starts (the guest must never
+	// observe the directory mid-restore). Legacy tmpfs-upper snapshots have no
+	// tar and skip all of this — their upper rides inside the restored guest
+	// memory.
+	//
+	// An error return between here and the join MUST drain the goroutine (the
+	// deferred receive below): returning with the untar still writing would let
+	// a retried restore's own untar race it inside the same directory.
+	hasUpper := snapshotHasRootfsUpper(restoreDir)
+	untarDone := make(chan error, 1)
+	untarJoined := false
+	if hasUpper {
+		go func() {
+			untarDone <- untarRootfsUpper(ateompath.RootfsUpperDir(actorUID), restoreDir)
+		}()
+		defer func() {
+			if !untarJoined {
+				<-untarDone
+			}
+		}()
+	}
+
 	// Reconstruct each container's overlay RO lower from the LOCAL OCI bundle (atelet
 	// re-unpacked the golden image; the lower is the immutable golden image) at the
 	// frozen find-paths location SharedDir(id)/<cid>/rootfs, and start the one virtiofsd
@@ -199,27 +226,6 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 		}()
 	}
 
-	// Disk-backed rootfs uppers: the snapshot says whether the guest expects the
-	// ateUpper share (its config.json references the fs device and the tar rides
-	// alongside), independent of this ateom's --rootfs-writes flag. Re-materialize
-	// the upper contents, then serve them exactly like the durable share — the tar
-	// reproduces the paths find-paths re-opens.
-	var upperVfsdCmd *exec.Cmd
-	if snapshotHasRootfsUpper(restoreDir) {
-		if err := untarRootfsUpper(ateompath.RootfsUpperDir(actorUID), restoreDir); err != nil {
-			return err
-		}
-		if upperVfsdCmd, err = s.stageRootfsUpperShare(ctx, rr, actorUID); err != nil {
-			return err
-		}
-		defer func() {
-			if retErr != nil && upperVfsdCmd.Process != nil {
-				_ = upperVfsdCmd.Process.Kill()
-				_, _ = upperVfsdCmd.Process.Wait()
-			}
-		}()
-	}
-
 	// Networking: rebuild the per-activation veth + tap; the snapshot's virtio-net
 	// is fd-backed, so CH needs fresh tap FDs (net_fds) on restore.
 	if err := ateomnet.SetupActorNetwork(ctx, ateomnet.NetworkConfig{
@@ -264,6 +270,28 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 			rn.FDs = append(rn.FDs, int(f.Fd()))
 		}
 		restoredNets = append(restoredNets, rn)
+	}
+
+	// Join the background untar and serve the re-materialized uppers exactly
+	// like the durable share — the tar reproduces the paths find-paths re-opens.
+	// Staged as late as possible (CH first needs the socket at Restore below) so
+	// the untar hid behind all of the setup above.
+	var upperVfsdCmd *exec.Cmd
+	if hasUpper {
+		untarErr := <-untarDone
+		untarJoined = true
+		if untarErr != nil {
+			return untarErr
+		}
+		if upperVfsdCmd, err = s.stageRootfsUpperShare(ctx, rr, actorUID); err != nil {
+			return err
+		}
+		defer func() {
+			if retErr != nil && upperVfsdCmd.Process != nil {
+				_ = upperVfsdCmd.Process.Kill()
+				_, _ = upperVfsdCmd.Process.Wait()
+			}
+		}()
 	}
 
 	// Relaunch CH and restore with the tap FDs attached (SCM_RIGHTS). CH reopens

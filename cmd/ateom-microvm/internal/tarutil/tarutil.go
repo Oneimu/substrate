@@ -230,15 +230,15 @@ func Extract(tarPath, dstDir string) error {
 		if skip {
 			continue
 		}
-		if err := extractEntry(dstDir, root, tr, hdr, name, dirs); err != nil {
+		if err := extractEntry(root, tr, hdr, name, dirs); err != nil {
 			return err
 		}
 	}
-	return restoreDirMeta(dstDir, root, dirs)
+	return restoreDirMeta(root, dirs)
 }
 
 // extractEntry materializes one archive entry under root.
-func extractEntry(dstDir string, root *os.Root, tr *tar.Reader, hdr *tar.Header, name string, dirs map[string]*tar.Header) error {
+func extractEntry(root *os.Root, tr *tar.Reader, hdr *tar.Header, name string, dirs map[string]*tar.Header) error {
 	mode := hdr.FileInfo().Mode().Perm()
 
 	switch hdr.Typeflag {
@@ -265,7 +265,7 @@ func extractEntry(dstDir string, root *os.Root, tr *tar.Reader, hdr *tar.Header,
 		if closeErr != nil {
 			return fmt.Errorf("closing %q: %w", name, closeErr)
 		}
-		return restoreMeta(dstDir, root, name, hdr)
+		return restoreMeta(root, name, hdr)
 
 	case tar.TypeSymlink:
 		if err := replaceExisting(root, name); err != nil {
@@ -285,7 +285,7 @@ func extractEntry(dstDir string, root *os.Root, tr *tar.Reader, hdr *tar.Header,
 		if err := createFifo(root, name, mode); err != nil {
 			return err
 		}
-		return restoreMeta(dstDir, root, name, hdr)
+		return restoreMeta(root, name, hdr)
 
 	case tar.TypeLink:
 		target, skip, err := cleanTarName(hdr.Linkname)
@@ -307,7 +307,7 @@ func extractEntry(dstDir string, root *os.Root, tr *tar.Reader, hdr *tar.Header,
 		if err := createDevice(root, name, hdr, mode); err != nil {
 			return err
 		}
-		return restoreMeta(dstDir, root, name, hdr)
+		return restoreMeta(root, name, hdr)
 
 	default:
 		return fmt.Errorf("unsupported tar entry type %q at %q", string([]byte{hdr.Typeflag}), name)
@@ -334,14 +334,14 @@ func replaceExisting(root *os.Root, name string) error {
 // directories, deepest first: a directory's path is always longer than its
 // parent's, so length-descending order restores children before the parent's
 // mode can make them unreachable.
-func restoreDirMeta(dstDir string, root *os.Root, dirs map[string]*tar.Header) error {
+func restoreDirMeta(root *os.Root, dirs map[string]*tar.Header) error {
 	names := make([]string, 0, len(dirs))
 	for name := range dirs {
 		names = append(names, name)
 	}
 	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
 	for _, name := range names {
-		if err := restoreMeta(dstDir, root, name, dirs[name]); err != nil {
+		if err := restoreMeta(root, name, dirs[name]); err != nil {
 			return err
 		}
 	}
@@ -365,7 +365,7 @@ func restoredMode(hdr *tar.Header) os.FileMode {
 // restoreMeta applies ownership, mode, and modification time to an extracted
 // path. Ownership is applied first because chowning a file clears its setuid
 // and setgid bits, which the chmod below then puts back.
-func restoreMeta(dstDir string, root *os.Root, name string, hdr *tar.Header) error {
+func restoreMeta(root *os.Root, name string, hdr *tar.Header) error {
 	if err := lchownEntry(root, name, hdr); err != nil {
 		return err
 	}
@@ -377,18 +377,50 @@ func restoreMeta(dstDir string, root *os.Root, name string, hdr *tar.Header) err
 			return fmt.Errorf("restoring times on %q: %w", name, err)
 		}
 	}
+	return restoreUserXattrs(root, name, hdr)
+}
 
-	// Restore user.* extended attributes from PAXRecords
+// restoreUserXattrs re-applies the user.* xattrs recorded in the entry's PAX
+// records (writeTree's SCHILY.xattr.* — the overlayfs opaque-directory markers
+// a userxattr-mode upper depends on).
+//
+// The target is addressed THROUGH its parent directory opened via root (the
+// same containment pattern createDevice uses), never by joining a host path:
+// a symlinked intermediate component in a crafted archive must not redirect
+// the write outside the extraction dir. The final component is addressed
+// path-wise under /proc/self/fd/<parent> rather than by opening the entry
+// itself — opening would block on a FIFO and fail on a whiteout device — and
+// Lsetxattr does not follow a final-component symlink (nor do symlink entries
+// take this path: extractEntry never calls restoreMeta for them, and Linux
+// refuses user.* xattrs on symlinks regardless).
+func restoreUserXattrs(root *os.Root, name string, hdr *tar.Header) error {
+	var attrs map[string]string
 	for k, v := range hdr.PAXRecords {
 		if strings.HasPrefix(k, "SCHILY.xattr.user.") {
-			attrName := strings.TrimPrefix(k, "SCHILY.xattr.")
-			hostPath := filepath.Join(dstDir, name)
-			if err := unix.Lsetxattr(hostPath, attrName, []byte(v), 0); err != nil {
-				return fmt.Errorf("restoring xattr %q on %q: %w", attrName, hostPath, err)
+			if attrs == nil {
+				attrs = map[string]string{}
 			}
+			attrs[strings.TrimPrefix(k, "SCHILY.xattr.")] = v
 		}
 	}
-
+	if len(attrs) == 0 {
+		return nil
+	}
+	dir, base := filepath.Split(name)
+	if dir == "" {
+		dir = "."
+	}
+	parent, err := root.Open(filepath.Clean(dir))
+	if err != nil {
+		return fmt.Errorf("opening parent directory of %q to restore xattrs: %w", name, err)
+	}
+	defer parent.Close()
+	for attr, val := range attrs {
+		target := fmt.Sprintf("/proc/self/fd/%d/%s", parent.Fd(), base)
+		if err := unix.Lsetxattr(target, attr, []byte(val), 0); err != nil {
+			return fmt.Errorf("restoring xattr %q on %q: %w", attr, name, err)
+		}
+	}
 	return nil
 }
 

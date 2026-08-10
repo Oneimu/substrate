@@ -17,11 +17,12 @@
 package kata
 
 // Each container's rootfs is an overlay: its OCI image served read-only over virtio-fs
-// (the lower) plus a writable upper. By default the upper is a guest tmpfs — in guest
-// RAM, so rootfs writes ride along in the memory snapshot and persist across
-// suspend/resume. With disk-backed rootfs writes (--rootfs-writes=disk, see
-// cmd/ateom-microvm/rootfsupper.go) the upper instead lives on the ateUpper virtio-fs
-// share, backed by host disk. This file holds the overlay-specific helpers.
+// (the lower) plus a writable upper on the ateUpper virtio-fs share, backed by host
+// disk (see cmd/ateom-microvm/rootfsupper.go). Rootfs writes therefore cost host disk,
+// not guest RAM, and persist across suspend/resume via the snapshot's rootfs-upper
+// tar. (Snapshots from the retired tmpfs-upper mode still restore: their upper rides
+// inside the restored guest memory and needs nothing from this file.) This file holds
+// the overlay-specific helpers.
 
 import (
 	"context"
@@ -58,13 +59,13 @@ const (
 	guestDurableDir = "/run/ateom-durable"
 
 	// UpperFsTag is the virtio-fs tag for the actor's disk-backed rootfs upper
-	// share (--rootfs-writes=disk), served by a third virtiofsd from
-	// ateompath.RootfsUpperDir on the host.
+	// share, served by a third virtiofsd from ateompath.RootfsUpperDir on the
+	// host.
 	UpperFsTag = "ateUpper"
 	// guestUpperDiskDir is where the agent mounts UpperFsTag in the guest; each
 	// container's overlay upper/work then live under <guestUpperDiskDir>/<cid>.
-	// Deliberately distinct from the tmpfs OverlayUpperBase prefix so the two
-	// modes can never alias.
+	// Deliberately distinct from the retired tmpfs upper's /run/ateom-upper
+	// prefix, which restored-from-old-snapshot guests may still have mounted.
 	guestUpperDiskDir = "/run/ateom-upper-disk"
 )
 
@@ -83,18 +84,21 @@ func SharedDir(id string) string {
 // VirtiofsdSocketPath is the vhost-user-fs socket CH connects to for the fs device.
 func VirtiofsdSocketPath(id string) string { return filepath.Join(VMDir(id), "virtiofsd.sock") }
 
-// OverlayUpperBase is the in-guest mount point for one container's overlay upper/work
-// in the default (memory) mode. It lives under /run (tmpfs) so the upper's writes are
-// in guest RAM and ride along in the memory-only snapshot (rootfs writes persist).
-// Keyed on the container id, which is stable across the actor's restore lineage.
-func OverlayUpperBase(containerID string) string { return "/run/ateom-upper/" + containerID }
-
-// DiskUpperBase is the in-guest mount point for one container's overlay upper/work
-// when rootfs writes are disk-backed: a subdirectory of the ateUpper virtio-fs share,
-// so the upper's writes land on host disk (ateompath.RootfsUpperDir) instead of guest
-// RAM — the memory snapshot stays lean and the upper ships as a tar instead. Keyed on
-// the container id like OverlayUpperBase.
+// DiskUpperBase is the in-guest mount point for one container's overlay upper/work:
+// a subdirectory of the ateUpper virtio-fs share, so the upper's writes land on host
+// disk (ateompath.RootfsUpperDir) instead of guest RAM — the memory snapshot stays
+// lean and the upper ships as a tar instead. Keyed on the container id, which is
+// stable across the actor's restore lineage.
 func DiskUpperBase(containerID string) string { return guestUpperDiskDir + "/" + containerID }
+
+// upperWorkDirs returns the overlay upperdir and workdir for an upper base:
+// SIBLING directories under the one base. Both properties are load-bearing —
+// the kernel requires upperdir and workdir on the same filesystem, and rejects
+// a workdir nested inside (or equal to) upperdir — so a layout change here
+// breaks every overlay mount. Covered by a regression test.
+func upperWorkDirs(upperBase string) (upper, work string) {
+	return upperBase + "/fs", upperBase + "/work"
+}
 
 // GuestSharedRootfs is the in-guest path the kataShared mount exposes a container's
 // rootfs at. A carrier container with this as Root.Path makes the agent bind it to
@@ -218,33 +222,33 @@ func ReconstructSharedDirFromImage(ctx context.Context, bundleRootfs, restoreID,
 }
 
 // CreateSandboxForActor creates the guest sandbox with the kataShared virtio-fs mount
-// (the RO base backing every container's rootfs). Mirrors kata startSandbox.
+// (the RO base backing every container's rootfs) and the writable disk-backed rootfs
+// upper share, under whose mount each container's overlay upper/work live
+// (DiskUpperBase). Mirrors kata startSandbox.
 //
 // withDurableShare additionally mounts the writable durable-dir share, whose
 // per-volume subdirectories the containers bind-mount at their declared paths.
-// withUpperShare additionally mounts the writable disk-backed rootfs upper share,
-// under whose mount each container's overlay upper/work live (DiskUpperBase).
-func (a *AgentClient) CreateSandboxForActor(ctx context.Context, sandboxID, hostname string, withDurableShare, withUpperShare bool) error {
-	storages := []*agentpb.Storage{{
-		Driver:     virtioFSDriver,
-		Source:     FsTag,
-		Fstype:     typeVirtioFS,
-		MountPoint: guestSharedDir,
-	}}
+func (a *AgentClient) CreateSandboxForActor(ctx context.Context, sandboxID, hostname string, withDurableShare bool) error {
+	storages := []*agentpb.Storage{
+		{
+			Driver:     virtioFSDriver,
+			Source:     FsTag,
+			Fstype:     typeVirtioFS,
+			MountPoint: guestSharedDir,
+		},
+		{
+			Driver:     virtioFSDriver,
+			Source:     UpperFsTag,
+			Fstype:     typeVirtioFS,
+			MountPoint: guestUpperDiskDir,
+		},
+	}
 	if withDurableShare {
 		storages = append(storages, &agentpb.Storage{
 			Driver:     virtioFSDriver,
 			Source:     DurableFsTag,
 			Fstype:     typeVirtioFS,
 			MountPoint: guestDurableDir,
-		})
-	}
-	if withUpperShare {
-		storages = append(storages, &agentpb.Storage{
-			Driver:     virtioFSDriver,
-			Source:     UpperFsTag,
-			Fstype:     typeVirtioFS,
-			MountPoint: guestUpperDiskDir,
 		})
 	}
 	return a.CreateSandbox(ctx, &agentpb.CreateSandboxRequest{
@@ -278,24 +282,24 @@ func (a *AgentClient) CreateCarrier(ctx context.Context, cid string, spec *specs
 
 // StartOverlayWorkload creates + starts one container with an overlayfs rootfs:
 // lower = the carrier's resolved bind (/run/kata-containers/<cid>/rootfs from the RO
-// virtio-fs base), upper/work = <upperBase>/{fs,work}. upperBase is either a guest
-// tmpfs (OverlayUpperBase: writes land in guest RAM, captured by the memory-only
-// snapshot) or a directory on the disk-backed ateUpper share (DiskUpperBase: writes
-// land on host disk, shipped as a tar at checkpoint). The agent creates the upper/work
-// dirs (create_directory) before mounting the overlay.
+// virtio-fs base), upper/work = <upperBase>/{fs,work} on the disk-backed ateUpper
+// share (DiskUpperBase: writes land on host disk, shipped as a tar at checkpoint).
+// The agent creates the upper/work dirs (create_directory) before mounting the
+// overlay.
 func (a *AgentClient) StartOverlayWorkload(ctx context.Context, cid, workloadID, upperBase string, spec *specs.Spec) error {
 	const createDir = "io.katacontainers.volume.overlayfs.create_directory"
 	sharedBase := "/run/kata-containers/" + cid + "/rootfs"
 	base := "/run/kata-containers/" + workloadID
 	lower := base + "/lower"
 	ovlRoot := base + "/rootfs"
-	upper := upperBase + "/fs"
-	work := upperBase + "/work"
+	upper, work := upperWorkDirs(upperBase)
 
-	options := []string{"lowerdir=" + lower, "upperdir=" + upper, "workdir=" + work}
-	if strings.HasPrefix(upperBase, guestUpperDiskDir) {
-		options = append(options, "index=off", "metacopy=off", "userxattr")
-	}
+	// index=off,metacopy=off,userxattr: required for an upper on virtio-fs — the
+	// guest kernel rejects the mount (EINVAL) with file-handle indexing enabled,
+	// and whiteouts/opaque markers must use unprivileged user.overlay.* xattrs
+	// (which the snapshot tar round-trips as PAX records).
+	options := []string{"lowerdir=" + lower, "upperdir=" + upper, "workdir=" + work,
+		"index=off", "metacopy=off", "userxattr"}
 
 	storages := []*agentpb.Storage{
 		{

@@ -51,19 +51,11 @@ import (
 	"google.golang.org/grpc/reflection"
 )
 
-func getRootfsWritesDefault() string {
-	if val := os.Getenv("ATEOM_ROOTFS_WRITES"); val != "" {
-		return val
-	}
-	return "memory"
-}
-
 var (
 	podUID       = flag.String("pod-uid", "", "The UID of the current pod")
 	chBinary     = flag.String("cloud-hypervisor-binary", "cloud-hypervisor", "Path to the cloud-hypervisor binary (used to relaunch on restore).")
 	kataConfig   = flag.String("kata-config", "", "Path to a kata configuration.toml (passed to the shim as KATA_CONF_FILE). Empty uses kata's default. atelet generates one pointing at runtime-fetched assets.")
 	kataDebug    = flag.Bool("kata-debug", false, "Verbose kata-agent debugging: raise the guest agent log level and forward the guest console (incl. agent logs) into the pod logs.")
-	rootfsWrites = flag.String("rootfs-writes", getRootfsWritesDefault(), "Where each container's overlay rootfs upper lives: \"memory\" (guest tmpfs: RAM-speed writes that ride in the memory snapshot, but every rootfs write is guest RAM) or \"disk\" (a host-disk-backed virtio-fs share: guest RAM and snapshots stay lean at the cost of virtio-fs write latency). Applies to cold boots; restores follow the snapshot they restore.")
 	showVersion  = flag.Bool("version", false, "Print version and exit.")
 	logLevelFlag = flag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
 
@@ -106,15 +98,6 @@ func do(ctx context.Context) error {
 		return err
 	}
 	slog.InfoContext(ctx, "ateom-microvm booting", slog.String("version", version.String()))
-
-	var diskRootfsWrites bool
-	switch *rootfsWrites {
-	case "memory":
-	case "disk":
-		diskRootfsWrites = true
-	default:
-		return fmt.Errorf("invalid --rootfs-writes %q: must be \"memory\" or \"disk\"", *rootfsWrites)
-	}
 
 	const serviceName = "ateom-microvm"
 	tp, err := serverboot.InitTracing(ctx, serverboot.TracingOptions{
@@ -228,7 +211,7 @@ func do(ctx context.Context) error {
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.UnaryInterceptor(ateinterceptors.InternalServerUnaryInterceptor),
 	)
-	ateompb.RegisterAteomServer(svr, NewService(*podUID, *chBinary, *kataConfig, *kataDebug, diskRootfsWrites, interiorNetNS, actorLogger, atunnelServer, atunnelEgress, atunnelEgressPort, *atunnelCredentialBundle, *atunnelEgressTrustBundle))
+	ateompb.RegisterAteomServer(svr, NewService(*podUID, *chBinary, *kataConfig, *kataDebug, interiorNetNS, actorLogger, atunnelServer, atunnelEgress, atunnelEgressPort, *atunnelCredentialBundle, *atunnelEgressTrustBundle))
 	reflection.Register(svr)
 
 	slog.InfoContext(ctx, "ateom-microvm serving", slog.String("socket", sockPath))
@@ -278,11 +261,6 @@ type AteomService struct {
 	chBinary   string
 	kataConfig string
 	kataDebug  bool
-	// diskRootfsWrites selects the disk-backed rootfs upper for COLD boots
-	// (--rootfs-writes=disk, see rootfsupper.go). Checkpoints and restores are
-	// self-describing instead (actorHasDiskUpper / snapshotHasRootfsUpper), so
-	// in-flight actors survive a flag flip.
-	diskRootfsWrites bool
 
 	// interiorNetNS hosts the per-activation actor veth peer (see net.go);
 	// kata is pointed at it.
@@ -309,13 +287,12 @@ type AteomService struct {
 var _ ateompb.AteomServer = (*AteomService)(nil)
 
 // NewService creates a new AteomService.
-func NewService(podUID, chBinary, kataConfig string, kataDebug, diskRootfsWrites bool, interiorNetNS netns.NsHandle, actorLogger *actorlog.ActorLogger, atunnelServer *atunnel.Server, atunnelEgress *atunnel.Egress, atunnelEgressPort uint16, credentialBundle, egressTrustBundle string) *AteomService {
+func NewService(podUID, chBinary, kataConfig string, kataDebug bool, interiorNetNS netns.NsHandle, actorLogger *actorlog.ActorLogger, atunnelServer *atunnel.Server, atunnelEgress *atunnel.Egress, atunnelEgressPort uint16, credentialBundle, egressTrustBundle string) *AteomService {
 	return &AteomService{
 		podUID:                   podUID,
 		chBinary:                 chBinary,
 		kataConfig:               kataConfig,
 		kataDebug:                kataDebug,
-		diskRootfsWrites:         diskRootfsWrites,
 		interiorNetNS:            interiorNetNS,
 		actorLogger:              actorLogger,
 		atunnel:                  atunnelServer,

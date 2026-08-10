@@ -16,37 +16,33 @@
 
 package main
 
-// Disk-backed rootfs writes for the micro-VM runtime (opt-in via
-// --rootfs-writes=disk).
+// Disk-backed rootfs writes for the micro-VM runtime.
 //
-// By default each container's overlay upper is a guest tmpfs: rootfs writes are
-// RAM-speed and ride along in the memory snapshot for free, but every byte the
-// actor writes is guest RAM — heavy writers inflate both the actor's memory
-// footprint and its snapshot (and with it suspend/resume latency). In disk mode
-// the upper moves to a THIRD virtio-fs share (kata.UpperFsTag), served by its
-// own virtiofsd from ateompath.RootfsUpperDir(actorUID) on the host: rootfs
-// writes leave guest RAM and the memory snapshot stays lean, at the cost of
-// virtio-fs write latency on every rootfs write. Which trade wins is
-// workload-dependent; the flag exists to measure exactly that.
+// Every container's overlay upper lives on a THIRD virtio-fs share
+// (kata.UpperFsTag), served by its own virtiofsd from
+// ateompath.RootfsUpperDir(actorUID) on the host: rootfs writes cost host disk,
+// not guest RAM. (The retired alternative — a guest tmpfs upper — capped rootfs
+// writes at the tmpfs size, a fifth of guest RAM, and pinned every written byte
+// in memory; snapshots taken in that mode still restore, see below.)
 //
 // The share is served like the durable-dir one — write-through (no
 // --writeback, so a paused guest's completed writes are already on the host),
 // cache=auto (the host contents change underneath the guest on restore), and
 // find-paths migration — plus --xattr, because overlayfs stores whiteouts and
-// opaque-directory markers as trusted.overlay.* xattrs in the upper and the
+// opaque-directory markers as user.overlay.* xattrs in the upper and the
 // guest kernel must round-trip them through virtiofsd. Unlike the durable dirs
 // (whose host side atelet owns), this directory is owned entirely by ateom:
 // created fresh at cold boot, re-materialized from the snapshot at restore,
 // and removed at teardown.
 //
-// Snapshots: the upper no longer rides in guest memory, so a FULL snapshot
+// Snapshots: the upper does not ride in guest memory, so a FULL snapshot
 // ships it as a tar (rootfsUpperTarFile) exactly like the durable volumes,
 // taken while the guest is paused. Restore is self-describing — the tar's
 // presence in the snapshot is what says the guest expects the ateUpper share
-// (the snapshot's config.json references its fs device), independent of the
-// flag the restoring ateom happens to run with. A DATA snapshot deliberately
-// excludes it: the workload cold-starts on restore, so rootfs state is
-// discarded under that scope in either mode.
+// (the snapshot's config.json references its fs device) — which is also what
+// keeps legacy tmpfs-upper snapshots restorable: no tar, no share, their upper
+// rides inside the restored guest memory. A DATA snapshot deliberately
+// excludes rootfs state: the workload cold-starts on restore.
 
 import (
 	"context"
