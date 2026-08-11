@@ -157,28 +157,18 @@ cd <your substrate checkout>
 
 Verify as in Option A, Step 4.
 
-## Smoke test: guest-memory snapshot round-trip
+## Trying it out
 
-The [counter demo](../../demos/counter/README.md) keeps its count in RAM, so a
-count that survives suspend/resume proves the guest-memory snapshot
-round-tripped. Same flow as the README Quickstart, using the microVM
-template:
-
-```sh
-kubectl ate create atespace demo   # skip if it already exists
-kubectl ate create actor vm-counter-1 -a demo --template ate-demo-counter-microvm/counter-microvm
-kubectl ate resume actor vm-counter-1 -a demo
-
-kubectl port-forward -n ate-system svc/atenet-router 8000:80 &
-curl -X POST -H "Host: vm-counter-1.demo.actors.resources.substrate.ate.dev" -i http://localhost:8000/
-curl -X POST -H "Host: vm-counter-1.demo.actors.resources.substrate.ate.dev" -i http://localhost:8000/
-
-# Suspend (checkpoints guest RAM to the snapshot bucket, frees the worker),
-# resume (possibly onto a different worker), and confirm the count continues:
-kubectl ate suspend actor vm-counter-1 -a demo
-kubectl ate resume actor vm-counter-1 -a demo
-curl -X POST -H "Host: vm-counter-1.demo.actors.resources.substrate.ate.dev" -i http://localhost:8000/
-```
+On completion, `run-microvm-demo-kind.sh` prints next steps: create an actor
+from the `counter-microvm` template, hit the in-RAM counter, then suspend and
+resume it and confirm the count continues — proving the guest-memory snapshot
+round-tripped. The flow is the same as the
+[README Quickstart](../../README.md#quickstart-development), just with the
+microVM template; see the
+[counter demo's micro-VM variant](../../demos/counter/README.md#micro-vm-variant)
+for background. (An `actortemplate` reporting `READY=True` in the verify step
+already exercises the runtime end-to-end — the golden snapshot requires a
+full guest boot and checkpoint.)
 
 ## Troubleshooting
 
