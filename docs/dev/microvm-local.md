@@ -56,8 +56,7 @@ cluster-wide microVM deps via `hack/install-microvm-deps.sh` — assembling the
 guest runtime assets for your architecture (skipped if already present under
 `bin/microvm-assets/`), staging them into the in-cluster rustfs bucket, and
 applying the `microvm` `SandboxConfig` — then deploys the demo worker pool +
-template. Staging currently requires the `aws` CLI on the host
-([install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)).
+template.
 
 ### 4. Verify
 
@@ -178,6 +177,5 @@ requires a full guest boot and checkpoint.
 | Symptom | Root cause | Fix |
 |---|---|---|
 | `/dev/kvm: permission denied` during the kind KVM probe | Rootless Docker: the probe container's root is remapped to your user, which can't open the device (`660 root:kvm`) | Use rootful Docker, or `sudo chmod 666 /dev/kvm` before `./hack/create-kind-cluster.sh` |
-| `error: the 'aws' CLI is required but was not found in PATH` | `stage-to-rustfs.sh` uses `aws s3 cp` to stage microVM assets | Install the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) |
 | `cargo not found` from `assemble.sh` | On arm64, `virtiofsd` is built from source | Install the build deps listed in Option B, Step 3 |
 | Lima: `[hostagent] Starting VZ ... FATA exiting` on M1 | M1 lacks FEAT_NV2 hardware nested virtualization | Use a newer Apple Silicon Mac, or a Linux/KVM host (Option A) |
