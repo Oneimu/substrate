@@ -38,7 +38,9 @@ Substrate decouples compute infrastructure from stateful agent execution:
 
 ## 2. Prerequisites (all paths)
 
-You need `docker`, `go`, `kind`, `ko`, and `kubectl`.
+You need `docker`, `go`, and `kubectl`. (`kind` and `ko` are pinned in
+`hack/tools/` and invoked automatically by the hack scripts — no install
+needed.)
 
 ```sh
 # Docker: follow https://docs.docker.com/engine/install/ for your distro, then:
@@ -49,18 +51,15 @@ docker ps              # should succeed without sudo
 # Go 1.26+ (see go.mod for the exact version)
 go version
 
-# kind + ko via Go, kubectl via your package manager
-go install sigs.k8s.io/kind@latest
-go install github.com/google/ko@latest
 # kubectl: https://kubernetes.io/docs/tasks/tools/
 
 # Go-installed binaries land in $(go env GOPATH)/bin — put it on PATH now,
-# you'll need it again for kubectl-ate later:
+# you'll need it for kubectl-ate later:
 export PATH="$(go env GOPATH)/bin:${PATH}"
 echo 'export PATH="$(go env GOPATH)/bin:${PATH}"' >> ~/.bashrc
 
 # Sanity check
-for tool in docker go kind ko kubectl; do
+for tool in docker go kubectl; do
   which "$tool" >/dev/null && echo "OK  $tool" || echo "MISSING  $tool"
 done
 ```
@@ -138,10 +137,12 @@ kubectl get nodes --show-labels | grep 'ate.dev/sandboxClass=microvm'
 kubectl get pods -n ate-system   # wait for Running/Completed
 ```
 
-Do this *before* the demo script: asset staging talks to the in-cluster
-rustfs S3 endpoint, which only exists once the control plane is deployed
-(otherwise you'll hit `upload failed: Could not connect to endpoint
-http://localhost:9000` — see the friction log).
+Do this *before* the demo script. `run-microvm-demo-kind.sh` also runs
+`--deploy-ate-system`, but only *after* it stages assets — and staging talks
+to the in-cluster rustfs S3 endpoint, which only exists once the control
+plane is deployed. On a fresh cluster, skipping this step fails with
+`upload failed: Could not connect to endpoint http://localhost:9000` (see
+the troubleshooting log).
 
 **Step 4 — run the microVM demo:**
 
@@ -198,13 +199,21 @@ path — much of Substrate's development happens on macOS via limactl.
 **Step 1 — install tooling:**
 
 ```sh
-brew install lima docker kind ko go
+brew install lima docker go kubectl
 ```
+
+(As in §2, `kind` and `ko` come from `hack/tools/` — no install needed.)
 
 **Step 2 — launch Lima with nested virtualization:**
 
+The guest image is pinned to Ubuntu 25.10 until the kernel issue in the
+current default image is fixed — revisit the pin once a fixed image ships:
+
 ```sh
-limactl start --name=docker-nested template:docker-rootful --nested-virt
+limactl start --name=docker-nested template://docker-rootful --nested-virt --set '.images = [
+{"location":"https://cloud-images.ubuntu.com/releases/questing/release/ubuntu-25.10-server-cloudimg-arm64.img","arch":"aarch64"},
+{"location":"https://cloud-images.ubuntu.com/releases/questing/release/ubuntu-25.10-server-cloudimg-amd64.img","arch":"x86_64"}
+]'
 ```
 
 When prompted to edit the configuration, set at least:
@@ -213,6 +222,8 @@ When prompted to edit the configuration, set at least:
 cpus: 8
 memory: "16GiB"
 nestedVirtualization: true
+networks:
+  - vzNAT: true
 mounts:
   - location: "~"
     writable: true
@@ -220,7 +231,7 @@ mounts:
 
 (The writable home mount lets the kind/ko workflows write into your checkout;
 8 CPUs / 16 GiB is a comfortable floor for the control plane plus a microVM
-worker.)
+worker; `vzNAT` gives the VM outbound networking under the vz VM type.)
 
 **Step 3 — assemble the arm64 assets *inside* the Lima VM:**
 
