@@ -130,30 +130,19 @@ instead, or open up the device with `sudo chmod 666 /dev/kvm`.
 kubectl get nodes --show-labels | grep 'ate.dev/sandboxClass=microvm'
 ```
 
-**Step 3 — deploy the control plane:**
-
-```sh
-./hack/install-ate-kind.sh --deploy-ate-system
-kubectl get pods -n ate-system   # wait for Running/Completed
-```
-
-Do this *before* the demo script. `run-microvm-demo-kind.sh` also runs
-`--deploy-ate-system`, but only *after* it stages assets — and staging talks
-to the in-cluster rustfs S3 endpoint, which only exists once the control
-plane is deployed. On a fresh cluster, skipping this step fails with
-`upload failed: Could not connect to endpoint http://localhost:9000` (see
-the troubleshooting log).
-
-**Step 4 — run the microVM demo:**
+**Step 3 — run the microVM demo:**
 
 ```sh
 ./hack/run-microvm-demo-kind.sh
 ```
 
-This assembles the 5 runtime assets for your architecture (skipped if they
-are already present under `bin/microvm-assets/`), stages them into
-`s3://ate-snapshots/kata-assets/` (the in-cluster rustfs bucket), re-applies
-the control plane, and deploys the microVM worker pool + template. See
+This is a one-shot bring-up: it deploys the control plane
+(`--deploy-ate-system`), then installs the cluster-wide microVM deps —
+assembling the 5 runtime assets for your architecture (skipped if already
+present under `bin/microvm-assets/`), staging them into
+`s3://ate-snapshots/kata-assets/` (the in-cluster rustfs bucket), and
+applying the `microvm` SandboxConfig — and finally deploys the demo worker
+pool + template. See
 [hack/microvm-assets/README.md](../../hack/microvm-assets/README.md) for the
 manual equivalent of each step.
 
@@ -168,7 +157,7 @@ manual equivalent of each step.
 > alias aws='docker run --rm --network host -v "$PWD:/aws" -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY amazon/aws-cli'
 > ```
 
-**Step 5 — verify:**
+**Step 4 — verify:**
 
 ```sh
 kubectl get pods -n ate-demo-counter-microvm
@@ -264,13 +253,12 @@ echo 'export DOCKER_HOST="unix://${HOME}/.lima/docker-nested/sock/docker.sock"' 
 
 cd <your substrate checkout>
 
-# Cluster + control plane + microVM demo
+# Cluster + microVM demo (the demo script deploys the control plane itself)
 ./hack/create-kind-cluster.sh
-./hack/install-ate-kind.sh --deploy-ate-system
 ./hack/run-microvm-demo-kind.sh
 ```
 
-Verify as in Option A, Step 5.
+Verify as in Option A, Step 4.
 
 ## 5. Workload testing & actor lifecycle
 
@@ -358,9 +346,8 @@ Issues actually hit during onboarding, with root causes and fixes:
 | 2 | `/dev/kvm: permission denied` during the kind KVM probe | Rootless Docker: the probe container's root is remapped to your user, which can't open the device (`660 root:kvm`) | Use rootful Docker, or `sudo chmod 666 /dev/kvm` before `./hack/create-kind-cluster.sh` |
 | 3 | `kubectl: command not found` from install scripts | `kubectl` not installed | Install per [kubernetes.io/docs/tasks/tools](https://kubernetes.io/docs/tasks/tools/) |
 | 4 | `error: the 'aws' CLI is required but was not found in PATH` | `stage-to-rustfs.sh` uses `aws s3 cp` to stage microVM assets | Install the AWS CLI, or use the dockerized alias in §4.1 (see known issue below) |
-| 5 | `upload failed: Could not connect to endpoint http://localhost:9000` | Assets staged before the control plane (and rustfs) were deployed | Run `./hack/install-ate-kind.sh --deploy-ate-system` first |
-| 6 | `error: unknown command "ate" for "kubectl"` | `go install ./cmd/kubectl-ate` put the plugin in `$(go env GOPATH)/bin`, which isn't on `PATH` | `export PATH="$(go env GOPATH)/bin:${PATH}"` (persist it in your shell rc) |
-| 7 | Lima: `[hostagent] Starting VZ ... FATA exiting` on M1 | M1 lacks FEAT_NV2 hardware nested virtualization | Use a newer Apple Silicon Mac, or a Linux/KVM host (Option A) |
+| 5 | `error: unknown command "ate" for "kubectl"` | `go install ./cmd/kubectl-ate` put the plugin in `$(go env GOPATH)/bin`, which isn't on `PATH` | `export PATH="$(go env GOPATH)/bin:${PATH}"` (persist it in your shell rc) |
+| 6 | Lima: `[hostagent] Starting VZ ... FATA exiting` on M1 | M1 lacks FEAT_NV2 hardware nested virtualization | Use a newer Apple Silicon Mac, or a Linux/KVM host (Option A) |
 
 ## 7. Known issues / planned improvements
 
