@@ -27,10 +27,11 @@ Guidelines](https://opensource.google/conduct/).
 
 ### Set up a local development environment
 
-New to the project? [docs/dev/onboarding.md](docs/dev/onboarding.md) walks
-through bringing up a local Substrate cluster on [kind](https://kind.sigs.k8s.io)
-— for both the gVisor and microVM runtimes — and exercising the full actor
-lifecycle, plus a troubleshooting log of common setup issues.
+The [Quickstart (Development)](README.md#quickstart-development) in the README
+covers bringing up a local cluster with the default (gVisor) runtime. To run
+the higher-friction microVM runtime locally — which needs `/dev/kvm`, or Lima
+nested virtualization on Apple Silicon — see
+[docs/dev/microvm-local.md](docs/dev/microvm-local.md).
 
 ## Contribution process
 
