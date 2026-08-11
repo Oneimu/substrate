@@ -7,7 +7,9 @@ environment — on Linux, or on Apple Silicon macOS via
 [Lima](https://lima-vm.io/) — then running the microVM counter demo and
 verifying a guest-memory snapshot round-trip.
 
-**Prerequisites:** complete the
+## Prerequisites
+
+Complete the
 [Quickstart (Development)](../../README.md#quickstart-development) in the
 README first — it covers the base tooling and the default (gVisor) path this
 guide builds on. For background on the runtime, see
@@ -19,7 +21,7 @@ guide builds on. For background on the runtime, see
 Works on bare-metal Linux or any cloud VM with nested virtualization enabled
 (e.g. GCE N2/N2D instances with nested virt, or equivalent on other clouds).
 
-**Step 1 — verify KVM:**
+### 1. Verify KVM
 
 ```sh
 ls -la /dev/kvm
@@ -34,7 +36,7 @@ Docker install. With **rootless Docker** the container's root is remapped to
 your user, so the probe fails with `permission denied` — use rootful Docker
 instead, or open up the device with `sudo chmod 666 /dev/kvm`.
 
-**Step 2 — create the cluster:**
+### 2. Create the cluster
 
 ```sh
 ./hack/create-kind-cluster.sh
@@ -43,7 +45,7 @@ instead, or open up the device with `sudo chmod 666 /dev/kvm`.
 kubectl get nodes --show-labels | grep 'ate.dev/sandboxClass=microvm'
 ```
 
-**Step 3 — run the microVM demo:**
+### 3. Run the microVM demo
 
 ```sh
 ./hack/run-microvm-demo-kind.sh
@@ -57,7 +59,7 @@ applying the `microvm` `SandboxConfig` — then deploys the demo worker pool +
 template. Staging currently requires the `aws` CLI on the host
 ([install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)).
 
-**Step 4 — verify:**
+### 4. Verify
 
 ```sh
 kubectl get pods -n ate-demo-counter-microvm
@@ -80,18 +82,19 @@ Lima can run a Linux VM with **nested virtualization**, exposing `/dev/kvm` to
 Docker (and therefore to the kind node) inside the VM. This is a well-trodden
 path — much of Substrate's development happens on macOS via limactl.
 
-> **Hardware requirement:** the first-generation M1 lacks hardware support for
-> ARM nested virtualization (FEAT_NV2) — Lima will fail with
+> [!IMPORTANT]
+> The first-generation M1 lacks hardware support for ARM nested
+> virtualization (FEAT_NV2) — Lima will fail with
 > `[hostagent] Starting VZ ... FATA exiting`. Use a newer Apple Silicon chip,
 > or fall back to Option A on a Linux host.
 
-**Step 1 — install Lima and the Docker CLI:**
+### 1. Install Lima and the Docker CLI
 
 ```sh
 brew install lima docker
 ```
 
-**Step 2 — launch Lima with nested virtualization:**
+### 2. Launch Lima with nested virtualization
 
 The guest image is pinned to Ubuntu 25.10 until the kernel issue in the
 current default image is fixed — revisit the pin once a fixed image ships:
@@ -116,11 +119,11 @@ mounts:
     writable: true
 ```
 
-(The writable home mount lets the kind/ko workflows write into your checkout;
+The writable home mount lets the kind/ko workflows write into your checkout,
 8 CPUs / 16 GiB is a comfortable floor for the control plane plus a microVM
-worker; `vzNAT` gives the VM outbound networking under the vz VM type.)
+worker, and `vzNAT` gives the VM outbound networking under the vz VM type.
 
-**Step 3 — assemble the arm64 assets *inside* the Lima VM:**
+### 3. Assemble the arm64 assets inside the Lima VM
 
 `hack/microvm-assets/assemble.sh` must run on a Linux host of the target
 architecture (on arm64 it builds `virtiofsd` from source with cargo against
@@ -143,7 +146,7 @@ The assets land in `bin/microvm-assets/arm64/` in your checkout, which is
 shared with the host through the home mount — the demo script will find them
 there and skip re-assembling.
 
-**Step 4 — point the Docker CLI at Lima and bring everything up (on macOS):**
+### 4. Point the Docker CLI at Lima and bring everything up (on macOS)
 
 ```sh
 export DOCKER_HOST="unix://${HOME}/.lima/docker-nested/sock/docker.sock"
@@ -155,7 +158,7 @@ cd <your substrate checkout>
 ./hack/run-microvm-demo-kind.sh
 ```
 
-Verify as in Option A, Step 4.
+Verify as in Option A, step 4.
 
 ## Trying it out
 
@@ -166,9 +169,9 @@ round-tripped. The flow is the same as the
 [README Quickstart](../../README.md#quickstart-development), just with the
 microVM template; see the
 [counter demo's micro-VM variant](../../demos/counter/README.md#micro-vm-variant)
-for background. (An `actortemplate` reporting `READY=True` in the verify step
-already exercises the runtime end-to-end — the golden snapshot requires a
-full guest boot and checkpoint.)
+for background. Note that an `actortemplate` reporting `READY=True` in the
+verify step already exercises the runtime end-to-end — the golden snapshot
+requires a full guest boot and checkpoint.
 
 ## Troubleshooting
 
