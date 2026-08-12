@@ -1,8 +1,8 @@
 # Running the microVM runtime locally
 
 The microVM sandbox class (`ateom-microvm`: a Kata guest on Cloud Hypervisor)
-needs `/dev/kvm`, which makes local bring-up higher-friction than the default
-gVisor path. This guide covers just that delta: getting a KVM-capable Docker
+needs `/dev/kvm`, which takes some extra setup compared to the default gVisor
+path. This guide covers just that delta: getting a KVM-capable Docker
 environment — on Linux, or on Apple Silicon macOS via
 [Lima](https://lima-vm.io/) — then running the microVM counter demo and
 verifying a guest-memory snapshot round-trip.
@@ -82,10 +82,11 @@ Docker (and therefore to the kind node) inside the VM. This is a well-trodden
 path — much of Substrate's development happens on macOS via limactl.
 
 > [!IMPORTANT]
-> The first-generation M1 lacks hardware support for ARM nested
-> virtualization (FEAT_NV2) — Lima will fail with
-> `[hostagent] Starting VZ ... FATA exiting`. Use a newer Apple Silicon chip,
-> or fall back to Option A on a Linux host.
+> Apple's Virtualization framework
+> [supports nested virtualization only on M3 and later](https://developer.apple.com/documentation/virtualization/vzgenericplatformconfiguration/isnestedvirtualizationsupported)
+> — on earlier Apple Silicon (M1/M2), Lima fails with
+> `[hostagent] Starting VZ ... FATA exiting`. Fall back to Option A on a
+> Linux host.
 
 ### 1. Install Lima and the Docker CLI
 
@@ -95,13 +96,14 @@ brew install lima docker
 
 ### 2. Launch Lima with nested virtualization
 
-The guest image is pinned to Ubuntu 25.10 until the kernel issue in the
-current default image is fixed — revisit the pin once a fixed image ships:
+The arm64 nested-virtualization kernel regression affects kernels 6.19 and
+newer, so use a guest image with an older kernel — pinned here to Ubuntu
+24.04 LTS:
 
 ```sh
 limactl start --name=docker-nested template://docker-rootful --nested-virt --set '.images = [
-{"location":"https://cloud-images.ubuntu.com/releases/questing/release/ubuntu-25.10-server-cloudimg-arm64.img","arch":"aarch64"},
-{"location":"https://cloud-images.ubuntu.com/releases/questing/release/ubuntu-25.10-server-cloudimg-amd64.img","arch":"x86_64"}
+{"location":"https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img","arch":"aarch64"},
+{"location":"https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img","arch":"x86_64"}
 ]'
 ```
 
@@ -178,4 +180,4 @@ requires a full guest boot and checkpoint.
 |---|---|---|
 | `/dev/kvm: permission denied` during the kind KVM probe | Rootless Docker: the probe container's root is remapped to your user, which can't open the device (`660 root:kvm`) | Use rootful Docker, or `sudo chmod 666 /dev/kvm` before `./hack/create-kind-cluster.sh` |
 | `cargo not found` from `assemble.sh` | On arm64, `virtiofsd` is built from source | Install the build deps listed in Option B, Step 3 |
-| Lima: `[hostagent] Starting VZ ... FATA exiting` on M1 | M1 lacks FEAT_NV2 hardware nested virtualization | Use a newer Apple Silicon Mac, or a Linux/KVM host (Option A) |
+| Lima: `[hostagent] Starting VZ ... FATA exiting` on M1/M2 | Apple's Virtualization framework supports nested virtualization only on M3 and later | Use an M3+ Mac, or a Linux/KVM host (Option A) |
