@@ -16,13 +16,18 @@
 
 package kata
 
-// Each container's rootfs is an overlay: its OCI image served read-only over virtio-fs
-// (the lower) plus a writable upper on the ateUpper virtio-fs share, backed by host
-// disk (see cmd/ateom-microvm/rootfsupper.go). Rootfs writes therefore cost host disk,
-// not guest RAM, and persist across suspend/resume via the snapshot's rootfs-upper
-// tar. (Snapshots from the retired tmpfs-upper mode still restore: their upper rides
-// inside the restored guest memory and needs nothing from this file.) This file holds
-// the overlay-specific helpers.
+// Each container's rootfs is an overlay assembled ON THE HOST — the stock kata
+// arrangement (containerd's overlay snapshotter does the same): lower = the OCI image
+// bundle, upper/work = host directories (see cmd/ateom-microvm/rootfsupper.go), merged
+// by the host kernel and served to the guest over the ONE kataShared virtio-fs share.
+// The guest runs the container on that directory directly; it never mounts an overlay
+// itself. Rootfs writes therefore cost host disk, not guest RAM, and persist across
+// suspend/resume via the snapshot's rootfs-upper tar.
+//
+// (Snapshots from the retired guest-tmpfs-upper mode still restore: their upper rides
+// inside the restored guest memory, and the lower is re-presented with the legacy
+// read-only bind, see ReconstructSharedDirFromImage.) This file holds the
+// rootfs-staging helpers.
 
 import (
 	"context"
@@ -57,17 +62,6 @@ const (
 	// volume's contents live at <guestDurableDir>/<volumeName> and are bind-mounted
 	// from there into the containers that declare the volume.
 	guestDurableDir = "/run/ateom-durable"
-
-	// UpperFsTag is the virtio-fs tag for the actor's WRITABLE disk-backed
-	// rootfs upper share, served by a third virtiofsd from
-	// ateompath.RootfsUpperDir on the host. Every container's overlay upper
-	// lives on it, so rootfs writes cost host disk, not guest RAM.
-	UpperFsTag = "ateUpper"
-	// guestUpperDir is where the agent mounts UpperFsTag in the guest; each
-	// container's overlay upper/work then live under <guestUpperDir>/<cid>.
-	// Deliberately distinct from the retired tmpfs upper's /run/ateom-upper
-	// prefix, which guests restored from old snapshots may still have mounted.
-	guestUpperDir = "/run/ateom-upper-disk"
 )
 
 // GuestDurableVolumeDir is the in-guest path holding one durable volume's
@@ -85,27 +79,20 @@ func SharedDir(id string) string {
 // VirtiofsdSocketPath is the vhost-user-fs socket CH connects to for the fs device.
 func VirtiofsdSocketPath(id string) string { return filepath.Join(VMDir(id), "virtiofsd.sock") }
 
-// UpperBase is the in-guest mount point for one container's overlay upper/work:
-// a subdirectory of the ateUpper virtio-fs share, so the upper's writes land on
-// host disk (ateompath.RootfsUpperDir) instead of guest RAM — the memory
-// snapshot stays lean and the upper ships as a tar instead (see
-// cmd/ateom-microvm/rootfsupper.go). Keyed on the container id, which is stable
-// across the actor's restore lineage.
-func UpperBase(containerID string) string { return guestUpperDir + "/" + containerID }
-
-// upperWorkDirs returns the overlay upperdir and workdir for an upper base:
-// SIBLING directories under the one base. Both properties are load-bearing —
-// the kernel requires upperdir and workdir on the same filesystem, and rejects
-// a workdir nested inside (or equal to) upperdir — so a layout change here
-// breaks every overlay mount. Covered by a regression test.
-func upperWorkDirs(upperBase string) (upper, work string) {
-	return upperBase + "/fs", upperBase + "/work"
+// UpperWorkDirs returns the HOST overlay upperdir and workdir for one container
+// under the actor's rootfs-upper base dir: SIBLING directories, <cid>/fs and
+// <cid>/work. Both properties are load-bearing — the kernel requires upperdir
+// and workdir on the same filesystem and rejects a nested workdir — and the
+// layout is also the snapshot tar's entry layout, so a change here breaks both
+// every overlay mount and every existing snapshot. Covered by regression tests.
+func UpperWorkDirs(upperBase, containerID string) (upper, work string) {
+	return filepath.Join(upperBase, containerID, "fs"), filepath.Join(upperBase, containerID, "work")
 }
 
 // GuestSharedRootfs is the in-guest path the kataShared mount exposes a container's
-// rootfs at. A carrier container with this as Root.Path makes the agent bind it to
-// /run/kata-containers/<cid>/rootfs — a stable per-container path the overlay then
-// uses as its lowerdir.
+// merged rootfs at. A container with this as Root.Path makes the agent's setup_bundle
+// bind it to /run/kata-containers/<cid>/rootfs and run the container there — the
+// stock kata flow.
 func GuestSharedRootfs(containerID string) string { return guestSharedDir + containerID + "/rootfs" }
 
 // VirtiofsdOptions configures StartVirtiofsd.
@@ -116,13 +103,6 @@ type VirtiofsdOptions struct {
 	// Cache is virtiofsd's --cache mode. Empty defaults to "always", which is
 	// only correct for a strictly read-only share (see virtiofsdArgs).
 	Cache string
-	// Xattr enables xattr passthrough (--xattr). Required for a share hosting an
-	// overlayfs upper: overlay records whiteouts and opaque directories as
-	// user.overlay.* xattrs in the upper (userxattr mode), and without
-	// passthrough the guest's overlay mount cannot round-trip them to the host
-	// (deletes of lower files would fail or silently un-delete across
-	// suspend/resume).
-	Xattr bool
 	Log   io.Writer
 }
 
@@ -130,15 +110,15 @@ type VirtiofsdOptions struct {
 func virtiofsdArgs(o VirtiofsdOptions) []string {
 	cache := o.Cache
 	if cache == "" {
-		// The overlay RO lower is served strictly read-only (the carrier remounts it
-		// ro and the guest's overlayfs lowerdir is immutable), so aggressively cache
-		// it in the guest for read performance — there is no host<>guest write churn
-		// to invalidate. A WRITABLE share (the durable-dir volumes) must instead pass
-		// Cache: "auto", because cache=always would serve stale data once the host
-		// side changes underneath the guest (e.g. contents restored from a snapshot).
+		// "always" is only correct for a strictly read-only share with immutable
+		// host contents — today that is solely the LEGACY restore path's bare-image
+		// share (see ReconstructSharedDirFromImage). WRITABLE shares (the merged
+		// rootfs, the durable-dir volumes) must pass Cache: "auto": the guest
+		// writes through them and the host contents change underneath the guest
+		// on restore, so cache=always would serve stale data.
 		cache = "always"
 	}
-	args := []string{
+	return []string{
 		"--socket-path=" + o.SocketPath,
 		"--shared-dir=" + o.SharedDir,
 		"--cache=" + cache,
@@ -146,10 +126,6 @@ func virtiofsdArgs(o VirtiofsdOptions) []string {
 		"--announce-submounts",
 		"--migration-mode", "find-paths",
 	}
-	if o.Xattr {
-		args = append(args, "--xattr")
-	}
-	return args
 }
 
 // StartVirtiofsd launches virtiofsd in find-paths migration mode serving o.SharedDir
@@ -183,11 +159,64 @@ func StartVirtiofsd(ctx context.Context, o VirtiofsdOptions) (*exec.Cmd, error) 
 	return nil, fmt.Errorf("virtiofsd socket %q did not appear", o.SocketPath)
 }
 
+// StageMergedRootfs mounts overlay(lower = the OCI image bundle rootfs, upper/work =
+// the actor's host rootfs-upper dirs for cid) at SharedDir(restoreID)/<cid>/rootfs —
+// the merged tree the ONE virtiofsd serves and the guest runs the container on
+// directly. The host kernel owns the overlay (the canonical ext4-upper case: no
+// special mount options, whiteouts/opaque markers are ordinary trusted.overlay.*
+// metadata in the upper), and the lower stays pristine (overlayfs never writes below).
+//
+// The merged path is identical on every node — find-paths migration re-opens the
+// guest's open files by path — given a deterministic image unpack plus the upper
+// re-materialized from the snapshot tar (see cmd/ateom-microvm/rootfsupper.go).
+func StageMergedRootfs(ctx context.Context, bundleRootfs, upperBase, restoreID, cid string) error {
+	if cid == "" {
+		return fmt.Errorf("StageMergedRootfs: empty container id")
+	}
+	dst := filepath.Join(SharedDir(restoreID), cid, "rootfs")
+	upper, work := UpperWorkDirs(upperBase, cid)
+	// Drop any stale mount first (lazy if busy), then ensure clean mountpoints.
+	if err := reaper.Run(exec.Command("umount", dst)); err != nil {
+		_ = reaper.Run(exec.Command("umount", "-l", dst))
+	}
+	for _, d := range []string{dst, upper, work} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return fmt.Errorf("creating %q: %w", d, err)
+		}
+	}
+	opts := "lowerdir=" + bundleRootfs + ",upperdir=" + upper + ",workdir=" + work
+	cmd := exec.CommandContext(ctx, "mount", "-t", "overlay", "overlay", "-o", opts, dst)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := reaper.Run(cmd); err != nil {
+		return fmt.Errorf("mounting merged rootfs overlay at %q: %w (%s)", dst, err, strings.TrimSpace(stderr.String()))
+	}
+	// Ensure the standard OCI mountpoints exist even for minimal images: the container
+	// mounts /proc,/sys,/dev over them, and find-paths re-opens the tree by path on
+	// restore, so the layout must match on every node. Created in the MERGED tree, so
+	// they land in the upper (and ride the snapshot tar) rather than dirtying the image.
+	for _, d := range []string{"proc", "sys", "dev"} {
+		_ = os.MkdirAll(filepath.Join(dst, d), 0o755)
+	}
+	return nil
+}
+
+// UnmountMergedRootfs drops one container's merged overlay mount (teardown and
+// failure paths; lazy fallback if busy). Best-effort like the rest of teardown —
+// CleanupSandboxState's sweep catches stragglers on the next boot.
+func UnmountMergedRootfs(restoreID, cid string) {
+	dst := filepath.Join(SharedDir(restoreID), cid, "rootfs")
+	if err := reaper.Run(exec.Command("umount", dst)); err != nil {
+		_ = reaper.Run(exec.Command("umount", "-l", dst))
+	}
+}
+
 // ReconstructSharedDirFromImage bind-mounts a container's OCI image rootfs at
-// <cid>/rootfs under SharedDir(restoreID) so virtiofsd serves it as the read-only lower.
-// The bind copies nothing on the host (virtiofsd serves files to the guest on demand).
-// The path is identical on every node — find-paths migration re-opens the lower by path
-// — given a deterministic image unpack. cid is stable across the actor's lineage.
+// <cid>/rootfs under SharedDir(restoreID) so virtiofsd serves it as the read-only
+// lower. LEGACY restores only: guests from retired guest-tmpfs-upper snapshots hold
+// this plain image tree open (their overlay upper lives inside the restored guest
+// memory), so the share must present the bare image, not a merged overlay. The bind
+// copies nothing on the host. cid is stable across the actor's lineage.
 func ReconstructSharedDirFromImage(ctx context.Context, bundleRootfs, restoreID, cid string) error {
 	if cid == "" {
 		return fmt.Errorf("ReconstructSharedDirFromImage: empty container id")
@@ -225,27 +254,17 @@ func ReconstructSharedDirFromImage(ctx context.Context, bundleRootfs, restoreID,
 }
 
 // CreateSandboxForActor creates the guest sandbox with the kataShared virtio-fs mount
-// (the RO base backing every container's rootfs) and the writable disk-backed rootfs
-// upper share, under whose mount each container's overlay upper/work live (UpperBase).
-// Mirrors kata startSandbox.
+// (the merged rootfs trees every container runs on). Mirrors kata startSandbox.
 //
 // withDurableShare additionally mounts the writable durable-dir share, whose
 // per-volume subdirectories the containers bind-mount at their declared paths.
 func (a *AgentClient) CreateSandboxForActor(ctx context.Context, sandboxID, hostname string, withDurableShare bool) error {
-	storages := []*agentpb.Storage{
-		{
-			Driver:     virtioFSDriver,
-			Source:     FsTag,
-			Fstype:     typeVirtioFS,
-			MountPoint: guestSharedDir,
-		},
-		{
-			Driver:     virtioFSDriver,
-			Source:     UpperFsTag,
-			Fstype:     typeVirtioFS,
-			MountPoint: guestUpperDir,
-		},
-	}
+	storages := []*agentpb.Storage{{
+		Driver:     virtioFSDriver,
+		Source:     FsTag,
+		Fstype:     typeVirtioFS,
+		MountPoint: guestSharedDir,
+	}}
 	if withDurableShare {
 		storages = append(storages, &agentpb.Storage{
 			Driver:     virtioFSDriver,
@@ -261,83 +280,28 @@ func (a *AgentClient) CreateSandboxForActor(ctx context.Context, sandboxID, host
 	})
 }
 
-// CreateCarrier creates a "carrier" container (id == cid): rootfs = the kataShared
-// virtio-fs base for that container, created but NOT started. This makes the agent's
-// setup_bundle bind the base to /run/kata-containers/<cid>/rootfs — the stable path the
-// overlay uses as its lowerdir (a bare virtio-fs submount is not reliably visible there).
-func (a *AgentClient) CreateCarrier(ctx context.Context, cid string, spec *specs.Spec) error {
+// StartRootfsContainer creates + starts one container on the shared merged rootfs —
+// the stock kata flow: the agent's setup_bundle binds shared/<cid>/rootfs to
+// /run/kata-containers/<cid>/rootfs and the container runs there. Writable: the
+// host-side overlay upper receives the writes (the guest mounts no overlay itself).
+func (a *AgentClient) StartRootfsContainer(ctx context.Context, cid string, spec *specs.Spec) error {
 	pbSpec := SpecToAgentPB(spec)
-	// Readonly: the carrier only exists to materialize the base bind; its rootfs (the
-	// overlay lower) must stay immutable. Overlay writes go to the disk-backed upper.
-	pbSpec.Root = &agentpb.Root{Path: GuestSharedRootfs(cid), Readonly: true}
+	pbSpec.Root = &agentpb.Root{Path: GuestSharedRootfs(cid), Readonly: false}
+	// Per-container cgroup: the shaped spec carries the actor-wide
+	// /ateomchv/<actorName> (spec.go), which collides across an actor's
+	// containers — use the per-id path.
 	if pbSpec.Linux != nil {
-		pbSpec.Linux.CgroupsPath = "/ateomchv/" + cid + "-carrier"
+		pbSpec.Linux.CgroupsPath = "/ateomchv/" + cid
 	}
 	if err := a.CreateContainer(ctx, &agentpb.CreateContainerRequest{
 		ContainerId: cid,
 		ExecId:      cid,
 		OCI:         pbSpec,
 	}); err != nil {
-		return fmt.Errorf("creating carrier container %q: %w", cid, err)
+		return fmt.Errorf("creating rootfs container %q: %w", cid, err)
 	}
-	return nil
-}
-
-// StartOverlayWorkload creates + starts one container with an overlayfs rootfs:
-// lower = the carrier's resolved bind (/run/kata-containers/<cid>/rootfs from the RO
-// virtio-fs base), upper/work = <upperBase>/{fs,work} on the disk-backed ateUpper
-// share (UpperBase: writes land on host disk, shipped as a tar at checkpoint). The
-// agent creates the upper/work dirs (create_directory) before mounting the overlay.
-func (a *AgentClient) StartOverlayWorkload(ctx context.Context, cid, workloadID, upperBase string, spec *specs.Spec) error {
-	const createDir = "io.katacontainers.volume.overlayfs.create_directory"
-	sharedBase := "/run/kata-containers/" + cid + "/rootfs"
-	base := "/run/kata-containers/" + workloadID
-	lower := base + "/lower"
-	ovlRoot := base + "/rootfs"
-	upper, work := upperWorkDirs(upperBase)
-
-	storages := []*agentpb.Storage{
-		{
-			Driver:     virtioFSDriver,
-			Source:     sharedBase,
-			MountPoint: lower,
-			Fstype:     "bind",
-			Options:    []string{"bind"},
-		},
-		{
-			Driver:     "overlayfs",
-			Source:     "overlay",
-			Fstype:     "overlay",
-			MountPoint: ovlRoot,
-			DriverOptions: []string{createDir + "=" + upper, createDir + "=" + work},
-			// index=off,metacopy=off,userxattr: required for an upper on
-			// virtio-fs — the guest kernel rejects the mount (EINVAL) with
-			// file-handle indexing enabled, and whiteouts/opaque markers must
-			// use unprivileged user.overlay.* xattrs (which the snapshot tar
-			// round-trips as PAX records; see tarutil).
-			Options: []string{"lowerdir=" + lower, "upperdir=" + upper, "workdir=" + work,
-				"index=off", "metacopy=off", "userxattr"},
-		},
-	}
-	pbSpec := SpecToAgentPB(spec)
-	pbSpec.Root = &agentpb.Root{Path: ovlRoot, Readonly: false}
-	// Per-workload cgroup: the shaped spec carries the actor-wide /ateomchv/<actorName>
-	// (spec.go), which collides across an actor's containers — mirror the carrier's
-	// per-id path so each workload gets its own cgroup.
-	if pbSpec.Linux != nil {
-		pbSpec.Linux.CgroupsPath = "/ateomchv/" + workloadID
-	}
-
-	if err := a.CreateContainer(ctx, &agentpb.CreateContainerRequest{
-		ContainerId: workloadID,
-		ExecId:      workloadID,
-		Storages:    storages,
-		OCI:         pbSpec,
-	}); err != nil {
-		return fmt.Errorf("creating overlay workload %q: %w", workloadID, err)
-	}
-	if err := a.StartContainer(ctx, workloadID); err != nil {
-		return fmt.Errorf("starting overlay workload %q: %w", workloadID, err)
+	if err := a.StartContainer(ctx, cid); err != nil {
+		return fmt.Errorf("starting rootfs container %q: %w", cid, err)
 	}
 	return nil
 }

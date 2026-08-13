@@ -161,7 +161,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	if scope == ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL && actorHasDiskUpper(actorUID) {
 		g.Go(func() error {
 			t := time.Now()
-			if err := tarRootfsUpper(gctx, ateompath.RootfsUpperDir(actorUID), checkpointDir); err != nil {
+			if err := tarRootfsUpper(gctx, rootfsUpperDir(actorUID), checkpointDir); err != nil {
 				return err
 			}
 			dUpper = time.Since(t)
@@ -313,9 +313,9 @@ func (s *AteomService) teardownActor(ctx context.Context, id string, ra *running
 			_ = ra.chCmd.Process.Kill()
 			_, _ = ra.chCmd.Process.Wait()
 		}
-		// Kill the virtiofsds (after CH, their only client): the overlay RO lower's
-		// and, when present, the writable durable-dir and rootfs upper shares'.
-		for _, cmd := range []*exec.Cmd{ra.vfsdCmd, ra.durableVfsdCmd, ra.upperVfsdCmd} {
+		// Kill the virtiofsds (after CH, their only client): the merged rootfs
+		// share's and, when the actor has durable-dir volumes, the durable share's.
+		for _, cmd := range []*exec.Cmd{ra.vfsdCmd, ra.durableVfsdCmd} {
 			if cmd != nil && cmd.Process != nil {
 				_ = cmd.Process.Kill()
 				_, _ = cmd.Process.Wait()
@@ -323,17 +323,20 @@ func (s *AteomService) teardownActor(ctx context.Context, id string, ra *running
 		}
 	}
 
+	// Sweep any leftover per-sandbox host-side state + orphaned per-sandbox
+	// processes. This is ateom's own cleanup (process kill + unmount + rm) —
+	// it also drops the merged rootfs overlay mounts, which MUST come before
+	// the upper-dir removal below (removing a live overlay's upperdir would
+	// corrupt the mount rather than delete the files).
+	kata.CleanupSandboxState(ctx, id)
+
 	// Remove the rootfs upper dir: ateom owns it — atelet's actor-dir reset
 	// doesn't know it — and its absence is what marks a worker as holding no
 	// disk-backed upper (actorHasDiskUpper). Runs after the checkpoint tar,
 	// which is already on disk. A no-op for legacy tmpfs-upper actors.
-	if err := os.RemoveAll(ateompath.RootfsUpperDir(id)); err != nil {
+	if err := os.RemoveAll(rootfsUpperDir(id)); err != nil {
 		slog.WarnContext(ctx, "Failed to remove rootfs upper dir", slog.String("actorUID", id), slog.Any("err", err))
 	}
-
-	// Sweep any leftover per-sandbox host-side state + orphaned per-sandbox
-	// processes. This is ateom's own cleanup (process kill + unmount + rm).
-	kata.CleanupSandboxState(ctx, id)
 
 	// Detach the bundle rootfs overlays composed in buildActorContainers, so
 	// atelet's bundle wipe doesn't strand live mounts in this namespace.

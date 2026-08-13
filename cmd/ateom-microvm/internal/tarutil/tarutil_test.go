@@ -402,10 +402,43 @@ func TestRoundTripDeviceNode(t *testing.T) {
 	}
 }
 
-// user.* xattrs must round-trip: overlayfs records a replaced lower-layer
-// directory as a user.overlay.opaque xattr on the upper directory (userxattr
-// mode), and dropping it would merge the old lower contents back in after a
-// restore.
+// trusted.overlay.* xattrs must round-trip: the host kernel's overlayfs
+// records a replaced lower-layer directory as a trusted.overlay.opaque xattr
+// on the upper directory, and dropping it would merge the old lower contents
+// back in after a restore. trusted.* needs CAP_SYS_ADMIN on both sides, as
+// ateom has.
+func TestRoundTripTrustedOverlayXattrs(t *testing.T) {
+	roottest.Require(t, "trusted.* xattrs require root")
+
+	src := t.TempDir()
+	if err := os.Mkdir(filepath.Join(src, "replaced-dir"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := unix.Lsetxattr(filepath.Join(src, "replaced-dir"), "trusted.overlay.opaque", []byte("y"), 0); err != nil {
+		t.Skipf("filesystem does not support trusted xattrs: %v", err)
+	}
+
+	tarPath := filepath.Join(t.TempDir(), "trusted.tar")
+	if err := Create(t.Context(), tarPath, src); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	dst := t.TempDir()
+	if err := Extract(tarPath, dst); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+
+	buf := make([]byte, 8)
+	n, err := unix.Lgetxattr(filepath.Join(dst, "replaced-dir"), "trusted.overlay.opaque", buf)
+	if err != nil {
+		t.Fatalf("reading trusted.overlay.opaque on restored dir: %v", err)
+	}
+	if got := string(buf[:n]); got != "y" {
+		t.Errorf("restored trusted.overlay.opaque = %q, want %q", got, "y")
+	}
+}
+
+// user.* xattrs must round-trip too: durable-dir volumes carry arbitrary
+// workload state, which may include user attrs.
 func TestRoundTripUserXattrs(t *testing.T) {
 	src := t.TempDir()
 	if err := os.Mkdir(filepath.Join(src, "replaced-dir"), 0o755); err != nil {
