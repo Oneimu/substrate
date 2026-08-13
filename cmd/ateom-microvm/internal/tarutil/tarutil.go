@@ -17,16 +17,17 @@
 // Package tarutil archives and restores a directory tree as a tar file,
 // preserving the metadata a workload's data directory depends on: modes,
 // ownership, modification times, symlinks, hardlinks, FIFOs, device nodes,
-// and user.* extended attributes (as PAX SCHILY.xattr records).
+// and user.* / trusted.overlay.* extended attributes (as PAX SCHILY.xattr
+// records).
 //
 // It exists for snapshotting durable-dir volumes and rootfs overlay uppers
 // (see cmd/ateom-microvm): the contents are written by the sandboxed workload
 // under arbitrary uids, shipped to object storage, and restored — possibly
 // onto another node — where the workload must see them unchanged. The upper
-// is why device nodes and xattrs matter: overlayfs records a deleted file as
-// a 0:0 character device (whiteout) and a replaced directory as a
-// user.overlay.opaque xattr, and losing either silently resurrects deleted
-// content after a resume.
+// is why device nodes and overlay xattrs matter: the host kernel's overlayfs
+// records a deleted file as a 0:0 character device (whiteout) and a replaced
+// directory as a trusted.overlay.opaque xattr, and losing either silently
+// resurrects deleted content after a resume.
 //
 // Extraction is confined to the destination with os.Root, so a crafted archive
 // cannot write outside it via "..", an absolute path, or a symlink.
@@ -134,12 +135,14 @@ func writeTree(ctx context.Context, tw *tar.Writer, srcDir string) error {
 		}
 		setOwner(hdr, info)
 
-		// user.* xattrs ride as PAX records — overlayfs stores its
-		// opaque-directory markers there (userxattr mode), and the round trip
-		// must preserve them or replaced directories un-replace on restore.
-		// Symlinks are exempt: Linux refuses user.* xattrs on them.
+		// Overlay-relevant xattrs ride as PAX records — the host kernel's
+		// overlayfs stores opaque-directory markers as trusted.overlay.*
+		// (and user.* is preserved for workload data) — and the round trip
+		// must keep them or replaced directories un-replace on restore.
+		// Symlinks are exempt: Linux refuses user.* xattrs on them, and
+		// overlay metadata never targets them.
 		if info.Mode()&os.ModeSymlink == 0 {
-			xattrs, err := readUserXattrs(path)
+			xattrs, err := readOverlayXattrs(path)
 			if err != nil {
 				return fmt.Errorf("reading xattrs of %q: %w", path, err)
 			}
@@ -385,12 +388,14 @@ func restoreMeta(root *os.Root, name string, hdr *tar.Header) error {
 			return fmt.Errorf("restoring times on %q: %w", name, err)
 		}
 	}
-	return restoreUserXattrs(root, name, hdr)
+	return restoreOverlayXattrs(root, name, hdr)
 }
 
-// restoreUserXattrs re-applies the user.* xattrs recorded in the entry's PAX
-// records (writeTree's SCHILY.xattr.* — the overlayfs opaque-directory markers
-// a userxattr-mode upper depends on).
+// restoreOverlayXattrs re-applies the user.* and trusted.overlay.* xattrs
+// recorded in the entry's PAX records (writeTree's SCHILY.xattr.* — the
+// overlayfs deletion metadata plus workload-owned user attrs). Writing
+// trusted.* requires CAP_SYS_ADMIN; extraction runs as root in ateom, and the
+// tests gate on it.
 //
 // The target is addressed THROUGH its parent directory opened via root (the
 // same containment pattern createFifo and createDevice use), never by joining
@@ -399,12 +404,12 @@ func restoreMeta(root *os.Root, name string, hdr *tar.Header) error {
 // addressed path-wise under /proc/self/fd/<parent> rather than by opening the
 // entry itself — opening would block on a FIFO and fail on a whiteout device —
 // and Lsetxattr does not follow a final-component symlink (nor do symlink
-// entries take this path: extractEntry never calls restoreMeta for them, and
-// Linux refuses user.* xattrs on symlinks regardless).
-func restoreUserXattrs(root *os.Root, name string, hdr *tar.Header) error {
+// entries take this path: extractEntry never calls restoreMeta for them).
+func restoreOverlayXattrs(root *os.Root, name string, hdr *tar.Header) error {
 	var attrs map[string]string
 	for k, v := range hdr.PAXRecords {
-		if strings.HasPrefix(k, "SCHILY.xattr.user.") {
+		if strings.HasPrefix(k, "SCHILY.xattr.user.") ||
+			strings.HasPrefix(k, "SCHILY.xattr.trusted.overlay.") {
 			if attrs == nil {
 				attrs = map[string]string{}
 			}
@@ -432,11 +437,13 @@ func restoreUserXattrs(root *os.Root, name string, hdr *tar.Header) error {
 	return nil
 }
 
-// readUserXattrs returns path's user.* extended attributes. Filesystems
-// without xattr support report none rather than failing: tarutil archives
-// arbitrary workload trees, and only the user.* namespace carries state the
-// round trip must preserve.
-func readUserXattrs(path string) (map[string]string, error) {
+// readOverlayXattrs returns path's user.* and trusted.overlay.* extended
+// attributes. Filesystems without xattr support report none rather than
+// failing: tarutil archives arbitrary workload trees, and only those two
+// namespaces carry state the round trip must preserve (trusted.overlay.* is
+// the host kernel's overlay deletion metadata; reading it requires root,
+// which archiving in ateom always has).
+func readOverlayXattrs(path string) (map[string]string, error) {
 	sz, err := unix.Llistxattr(path, nil)
 	if err != nil {
 		if errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
@@ -454,7 +461,7 @@ func readUserXattrs(path string) (map[string]string, error) {
 
 	var attrs map[string]string
 	for _, attr := range strings.Split(string(buf[:sz]), "\x00") {
-		if !strings.HasPrefix(attr, "user.") {
+		if !strings.HasPrefix(attr, "user.") && !strings.HasPrefix(attr, "trusted.overlay.") {
 			continue
 		}
 		vsz, err := unix.Lgetxattr(path, attr, nil)

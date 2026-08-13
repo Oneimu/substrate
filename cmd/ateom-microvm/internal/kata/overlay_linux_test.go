@@ -25,19 +25,25 @@ import (
 
 // The kernel requires overlay upperdir and workdir on the same filesystem and
 // rejects a workdir nested inside (or equal to) upperdir — so they must be
-// SIBLINGS under the one upper base on the ateUpper share. A layout change
-// here breaks every overlay mount.
+// SIBLINGS under the container's subdirectory of the actor's upper base. The
+// layout is also the snapshot tar's entry layout (<cid>/fs, <cid>/work), so a
+// change here breaks every overlay mount AND every existing snapshot.
 func TestUpperWorkDirsAreSiblings(t *testing.T) {
-	base := UpperBase("app")
-	upper, work := upperWorkDirs(base)
-	if filepath.Dir(upper) != base || filepath.Dir(work) != base {
-		t.Errorf("upperWorkDirs(%q) = %q, %q; want both directly under the base", base, upper, work)
+	const base = "/var/lib/ateom-gvisor/actors/uid/rootfs-upper"
+	upper, work := UpperWorkDirs(base, "app")
+	cidDir := filepath.Join(base, "app")
+	if filepath.Dir(upper) != cidDir || filepath.Dir(work) != cidDir {
+		t.Errorf("UpperWorkDirs = %q, %q; want both directly under %q", upper, work, cidDir)
 	}
 	if upper == work {
-		t.Errorf("upperWorkDirs(%q): upper and work are the same directory %q", base, upper)
+		t.Errorf("UpperWorkDirs: upper and work are the same directory %q", upper)
 	}
 	if strings.HasPrefix(work+"/", upper+"/") {
-		t.Errorf("upperWorkDirs(%q): work %q is nested inside upper %q", base, work, upper)
+		t.Errorf("UpperWorkDirs: work %q is nested inside upper %q", work, upper)
+	}
+	// Tar-layout invariant: entries are <cid>/fs and <cid>/work.
+	if upper != filepath.Join(base, "app", "fs") || work != filepath.Join(base, "app", "work") {
+		t.Errorf("UpperWorkDirs = %q, %q; want the snapshot layout <base>/app/{fs,work}", upper, work)
 	}
 }
 
@@ -46,32 +52,20 @@ func TestVirtiofsdArgs(t *testing.T) {
 		name      string
 		opts      VirtiofsdOptions
 		wantCache string
-		wantXattr bool
 	}{
 		{
-			name:      "RO lower defaults to cache=always",
+			name:      "legacy bare-image share defaults to cache=always",
 			opts:      VirtiofsdOptions{SocketPath: "/run/vm/virtiofsd.sock", SharedDir: "/run/shared"},
 			wantCache: "--cache=always",
 		},
 		{
-			name: "writable durable share overrides the cache mode",
+			name: "writable merged-rootfs share overrides the cache mode",
 			opts: VirtiofsdOptions{
-				SocketPath: "/run/vm/virtiofsd-durable.sock",
-				SharedDir:  "/var/lib/ateom-gvisor/actors/uid/durable-dir",
+				SocketPath: "/run/vm/virtiofsd.sock",
+				SharedDir:  "/run/kata-containers/shared/sandboxes/uid/shared",
 				Cache:      "auto",
 			},
 			wantCache: "--cache=auto",
-		},
-		{
-			name: "rootfs upper share passes xattrs through",
-			opts: VirtiofsdOptions{
-				SocketPath: "/run/vm/virtiofsd-upper.sock",
-				SharedDir:  "/var/lib/ateom-gvisor/actors/uid/rootfs-upper",
-				Cache:      "auto",
-				Xattr:      true,
-			},
-			wantCache: "--cache=auto",
-			wantXattr: true,
 		},
 	}
 	for _, tc := range tests {
@@ -80,11 +74,10 @@ func TestVirtiofsdArgs(t *testing.T) {
 			if !slices.Contains(args, tc.wantCache) {
 				t.Errorf("args %v do not contain %q", args, tc.wantCache)
 			}
-			// Overlay whiteouts/opaque markers are user.overlay.* xattrs in the
-			// upper; a share hosting an upper must pass them through, and the
-			// others must not pay the passthrough cost.
-			if gotXattr := slices.Contains(args, "--xattr"); gotXattr != tc.wantXattr {
-				t.Errorf("args %v: --xattr present = %v, want %v", args, gotXattr, tc.wantXattr)
+			// The host kernel owns the overlay; the guest needs no xattr
+			// passthrough, so the flag must never be emitted.
+			if slices.Contains(args, "--xattr") {
+				t.Errorf("args %v contain --xattr; the guest has no overlay to feed it to", args)
 			}
 			for _, want := range []string{
 				"--socket-path=" + tc.opts.SocketPath,

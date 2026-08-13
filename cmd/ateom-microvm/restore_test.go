@@ -86,40 +86,40 @@ func TestRewriteSnapshotSocketPaths(t *testing.T) {
 	})
 
 	t.Run("each share keeps its own socket", func(t *testing.T) {
-		// Ordered with the RO lower last to catch a rewrite that assumes it comes
-		// first, which would hand the guest the wrong filesystem.
+		// Ordered with the rootfs share last to catch a rewrite that assumes it
+		// comes first, which would hand the guest the wrong filesystem.
 		dir := writeSnapshotConfig(t, []map[string]any{
 			{"tag": kata.DurableFsTag, "socket": "/run/vc/vm/golden/virtiofsd-durable.sock"},
-			{"tag": kata.UpperFsTag, "socket": "/run/vc/vm/golden/virtiofsd-upper.sock"},
 			{"tag": kata.FsTag, "socket": "/run/vc/vm/golden/virtiofsd.sock"},
 		})
 		if err := rewriteSnapshotSocketPaths(dir, id); err != nil {
 			t.Fatalf("rewriteSnapshotSocketPaths: %v", err)
 		}
 		got := readFsSockets(t, dir)
-		want := map[string]string{
+		for tag, want := range map[string]string{
 			kata.FsTag:        kata.VirtiofsdSocketPath(id),
 			kata.DurableFsTag: kata.DurableVirtiofsdSocketPath(id),
-			kata.UpperFsTag:   kata.UpperVirtiofsdSocketPath(id),
+		} {
+			if got[tag] != want {
+				t.Errorf("%s socket = %q, want %q", tag, got[tag], want)
+			}
 		}
-		seen := map[string]string{}
-		for tag, w := range want {
-			if got[tag] != w {
-				t.Errorf("%s socket = %q, want %q", tag, got[tag], w)
-			}
-			if prev, dup := seen[got[tag]]; dup {
-				t.Errorf("shares %s and %s were pointed at the same socket %q", prev, tag, got[tag])
-			}
-			seen[got[tag]] = tag
+		if got[kata.FsTag] == got[kata.DurableFsTag] {
+			t.Error("both shares were pointed at the same socket")
 		}
 	})
 
 	t.Run("unknown tag is an error", func(t *testing.T) {
-		dir := writeSnapshotConfig(t, []map[string]any{
-			{"tag": "somethingElse", "socket": "/run/vc/vm/golden/other.sock"},
-		})
-		if err := rewriteSnapshotSocketPaths(dir, id); err == nil {
-			t.Fatal("rewriteSnapshotSocketPaths accepted an unknown fs tag, want an error")
+		// "ateUpper" is the retired third share's tag: it never appears in
+		// snapshots this code produces, and one showing up must fail loudly
+		// rather than be silently repointed.
+		for _, tag := range []string{"somethingElse", "ateUpper"} {
+			dir := writeSnapshotConfig(t, []map[string]any{
+				{"tag": tag, "socket": "/run/vc/vm/golden/other.sock"},
+			})
+			if err := rewriteSnapshotSocketPaths(dir, id); err == nil {
+				t.Fatalf("rewriteSnapshotSocketPaths accepted fs tag %q, want an error", tag)
+			}
 		}
 	})
 

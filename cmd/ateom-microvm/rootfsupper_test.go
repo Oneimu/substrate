@@ -22,9 +22,9 @@ import (
 	"testing"
 )
 
-// upperDirWith returns a rootfs upper directory laid out the way the guest
-// agent builds one: <workloadID>/{fs,work} per container, with the given
-// files created under it (paths relative to the directory).
+// upperDirWith returns a rootfs upper directory laid out the way the host
+// overlay staging builds one: <containerID>/{fs,work} per container, with the
+// given files created under it (paths relative to the directory).
 func upperDirWith(t *testing.T, files map[string]string) string {
 	t.Helper()
 	dir := t.TempDir()
