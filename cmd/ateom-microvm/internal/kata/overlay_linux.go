@@ -209,7 +209,18 @@ func StageMergedRootfs(ctx context.Context, bundleRootfs, upperBase, restoreID, 
 			return fmt.Errorf("creating %q: %w", d, err)
 		}
 	}
-	opts := "lowerdir=" + bundleRootfs + ",upperdir=" + upper + ",workdir=" + work
+	// metacopy=off,index=off: pinned rather than inherited from the host's
+	// overlay module defaults. Both features record file-handle references to
+	// LOWER inodes in the upper (a metacopy'd file is a data-less upper entry
+	// whose trusted.overlay.origin handle is where the data lives), and the
+	// snapshot tar preserves trusted.overlay.* verbatim — but restore rebuilds
+	// the lower from the OCI bundle with fresh inodes, so a preserved handle
+	// goes stale and the file turns silently unreadable after resume. With both
+	// off, every copy-up is a full data copy and the upper is self-contained —
+	// the portability the find-paths comment above promises. (redirect_dir is
+	// path-based and travels fine, so it stays at the kernel default.)
+	opts := "lowerdir=" + bundleRootfs + ",upperdir=" + upper + ",workdir=" + work +
+		",metacopy=off,index=off"
 	cmd := exec.CommandContext(ctx, "mount", "-t", "overlay", "overlay", "-o", opts, dst)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
