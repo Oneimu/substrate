@@ -239,10 +239,43 @@ func TestRoundTripFifo(t *testing.T) {
 // snapshots: a socket in the archived tree — which agents leave behind routinely
 // — must not fail the archive, because that would make the actor impossible to
 // suspend.
-// CreateFiltered must drop exactly the entries the skip function selects — for
-// a directory, the whole subtree — and leave everything else identical to an
-// unfiltered archive. The rootfs snapshot leans on this to exclude overlay
-// workdirs.
+func TestCreateSkipsSockets(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "keep.txt"), []byte("data"), 0o644); err != nil {
+		t.Fatalf("writing file: %v", err)
+	}
+	l, err := net.Listen("unix", filepath.Join(src, "agent.sock"))
+	if err != nil {
+		t.Fatalf("creating socket: %v", err)
+	}
+	defer l.Close()
+
+	tarPath := filepath.Join(t.TempDir(), "sock.tar")
+	if err := Create(t.Context(), tarPath, src); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	dst := t.TempDir()
+	if err := Extract(tarPath, dst); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+
+	// The rest of the tree survives; the socket itself is dropped.
+	got, err := os.ReadFile(filepath.Join(dst, "keep.txt"))
+	if err != nil {
+		t.Fatalf("reading archived file: %v", err)
+	}
+	if string(got) != "data" {
+		t.Errorf("keep.txt = %q, want %q", got, "data")
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "agent.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("socket was archived (lstat err = %v), want it skipped", err)
+	}
+}
+
+// TestCreateFilteredSkipsSubtree verifies CreateFiltered drops exactly the
+// entries the skip function selects — for a directory, the whole subtree — and
+// leaves everything else identical to an unfiltered archive. The rootfs
+// snapshot leans on this to exclude overlay workdirs.
 func TestCreateFilteredSkipsSubtree(t *testing.T) {
 	src := t.TempDir()
 	for rel, content := range map[string]string{
@@ -280,39 +313,6 @@ func TestCreateFilteredSkipsSubtree(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dst, "app/work")); !os.IsNotExist(err) {
 		t.Errorf("skipped subtree app/work survived (stat err = %v), want absent", err)
-	}
-}
-
-func TestCreateSkipsSockets(t *testing.T) {
-	src := t.TempDir()
-	if err := os.WriteFile(filepath.Join(src, "keep.txt"), []byte("data"), 0o644); err != nil {
-		t.Fatalf("writing file: %v", err)
-	}
-	l, err := net.Listen("unix", filepath.Join(src, "agent.sock"))
-	if err != nil {
-		t.Fatalf("creating socket: %v", err)
-	}
-	defer l.Close()
-
-	tarPath := filepath.Join(t.TempDir(), "sock.tar")
-	if err := Create(t.Context(), tarPath, src); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	dst := t.TempDir()
-	if err := Extract(tarPath, dst); err != nil {
-		t.Fatalf("Extract: %v", err)
-	}
-
-	// The rest of the tree survives; the socket itself is dropped.
-	got, err := os.ReadFile(filepath.Join(dst, "keep.txt"))
-	if err != nil {
-		t.Fatalf("reading archived file: %v", err)
-	}
-	if string(got) != "data" {
-		t.Errorf("keep.txt = %q, want %q", got, "data")
-	}
-	if _, err := os.Lstat(filepath.Join(dst, "agent.sock")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("socket was archived (lstat err = %v), want it skipped", err)
 	}
 }
 
