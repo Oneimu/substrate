@@ -29,7 +29,7 @@ WORKER_COUNT=1
 SANDBOX_CLASS=gvisor
 SKIP_BUILD=0
 OTLP_ENDPOINT=""
-# Empty keeps the default in workloads/deploy.sh (512Mi, the microvm minimum).
+# Empty keeps the default in workloads/deploy.sh (256Mi, the microvm minimum).
 ACTOR_MEMORY=""
 
 usage() {
@@ -44,7 +44,7 @@ usage() {
   echo "  --otlp-endpoint URL     Forwarded to workloads/deploy.sh. The address to which an"
   echo "                          instrumented actor container sends telemetry."
   echo "  --actor-memory SIZE     Forwarded to workloads/deploy.sh. Memory limit for the"
-  echo "                          benchmark ActorTemplates (default: 512Mi, the microvm minimum)."
+  echo "                          benchmark ActorTemplates (default: 256Mi, the microvm minimum)."
   echo "  --skip-build            Skip locust image build/push (use the existing :latest image)"
   echo "  -h|--help               Show this help message"
   echo ""

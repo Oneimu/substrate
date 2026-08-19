@@ -27,7 +27,7 @@
 # Optional `sandboxClass` (default "gvisor") picks the sandbox runtime for
 # the benchmark WorkerPool. Allowed values: "gvisor" | "microvm".
 #
-# Optional `actorMemory` (default "512Mi", the smallest size microvm admits)
+# Optional `actorMemory` (default "256Mi", the smallest size microvm admits)
 # sets the memory limit on the benchmark ActorTemplates. Raise it for suites
 # that exercise glutton's WriteRAM path.
 #

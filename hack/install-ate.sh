@@ -105,7 +105,7 @@ function usage() {
   echo "  --benchmark-worker-count N             Number of WorkerPool replicas (default: 1)"
   echo "  --benchmark-sandbox-class CLASS        Sandbox runtime for the benchmark WorkerPool: gvisor | microvm (default: gvisor)."
   echo "                                         microvm requires hack/install-microvm-deps.sh --install to have run."
-  echo "  --benchmark-actor-memory SIZE          Memory limit for the benchmark ActorTemplates (default: 512Mi,"
+  echo "  --benchmark-actor-memory SIZE          Memory limit for the benchmark ActorTemplates (default: 256Mi,"
   echo "                                         the smallest size microvm admits)"
   echo ""
   for demo_name in "${ATE_DEMOS[@]}"; do
@@ -923,7 +923,7 @@ done
 SETUP_CSI=false
 BENCHMARK_WORKER_COUNT=1
 BENCHMARK_SANDBOX_CLASS=gvisor
-# Empty keeps the default in benchmarking/workloads/deploy.sh (512Mi).
+# Empty keeps the default in benchmarking/workloads/deploy.sh (256Mi).
 BENCHMARK_ACTOR_MEMORY=""
 prescan_args=("$@")
 for ((i = 0; i < ${#prescan_args[@]}; i++)); do
@@ -971,7 +971,7 @@ for ((i = 0; i < ${#prescan_args[@]}; i++)); do
       ;;
     --benchmark-actor-memory)
       if (( i + 1 >= ${#prescan_args[@]} )); then
-        echo "Error: --benchmark-actor-memory requires a size (e.g. 512Mi)" >&2
+        echo "Error: --benchmark-actor-memory requires a size (e.g. 256Mi)" >&2
         exit 1
       fi
       BENCHMARK_ACTOR_MEMORY="${prescan_args[$((i + 1))]}"

@@ -49,7 +49,7 @@ spec:
   # Without a limit a microvm actor gets the kata default 2 GiB guest, and
   # anything the guest kernel caches rides along in the memory snapshot —
   # bigger guest, bigger snapshot, slower suspend/resume. microvm requires at
-  # least 512Mi (256Mi VMM reserve + 256Mi guest floor).
+  # least 256Mi (128Mi VMM reserve + 128Mi guest floor).
   resources:
     limits:
       memory: ${ACTOR_MEMORY}
