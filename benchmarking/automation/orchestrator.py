@@ -332,6 +332,7 @@ def deploy_workloads(
     sandbox_class: str = "gvisor",
     actor_memory: str = "",
     wait_timeout: str = "",
+    mem_target: str = "",
 ) -> None:
     cmd = [
         "benchmarking/workloads/deploy.sh",
@@ -348,6 +349,10 @@ def deploy_workloads(
     # Empty keeps deploy.sh's own default; large fleets set workerWaitTimeout.
     if wait_timeout:
         cmd += ["--wait-timeout", wait_timeout]
+    # Empty keeps glutton's self-driving memory load disabled; large-memory
+    # suites set memTarget in tests.yaml (with actorMemory sized above it).
+    if mem_target:
+        cmd += ["--mem-target", mem_target]
     run(cmd)
     # Block until ActorTemplates are Ready
     run(
@@ -535,6 +540,7 @@ def main() -> None:
                     sandbox_class,
                     test.get("actorMemory", ""),
                     test.get("workerWaitTimeout", ""),
+                    test.get("memTarget", ""),
                 )
                 try:
                     status = run_test(

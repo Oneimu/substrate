@@ -43,6 +43,10 @@ SANDBOX_CLASS="gvisor"
 # so benchmark actors do not inherit the 2 GiB kata default and drag its page
 # cache into every memory snapshot. Raise it for RAM-consuming suites.
 ACTOR_MEMORY="256Mi"
+# Resident working set the glutton actor holds on its own (--mem-target in
+# cmd/benchmarking/glutton/memload.go). Empty disables the load; large-memory
+# suites set e.g. 1Gi with --actor-memory sized above it for headroom.
+MEM_TARGET=""
 # The address to which an instrumented actor container sends its telemetry.
 # --otlp-endpoint sets it. Without the flag, resolve_otlp_endpoint reads the
 # address that the control plane uses.
@@ -61,6 +65,8 @@ usage() {
   echo "                              microvm requires hack/install-microvm-deps.sh --install to have run."
   echo "  --actor-memory SIZE         Memory limit for the benchmark ActorTemplates (default: 256Mi,"
   echo "                              the smallest size microvm admits)"
+  echo "  --mem-target SIZE           Resident working set glutton holds and keeps re-dirtying"
+  echo "                              (default: empty = disabled). Size --actor-memory above it."
   echo "  --otlp-endpoint URL         The address to which an instrumented actor container"
   echo "                              sends telemetry (default: the endpoint in the"
   echo "                              ate-otel-config ConfigMap)"
@@ -106,12 +112,13 @@ substitute() {
       -e "s|\${SANDBOX_CONFIG_NAME}|${sandbox_config_name}|g" \
       -e "s|\${OTLP_ENDPOINT}|${OTLP_ENDPOINT}|g" \
       -e "s|\${ACTOR_MEMORY}|${ACTOR_MEMORY}|g" \
+      -e "s|\${MEM_TARGET}|${MEM_TARGET}|g" \
       "${MANIFEST_TEMPLATE}"
 }
 
 deploy() {
   resolve_otlp_endpoint
-  echo "Deploying workloads (worker_count=${WORKER_COUNT}, actor_memory=${ACTOR_MEMORY}, otlp_endpoint=${OTLP_ENDPOINT})..."
+  echo "Deploying workloads (worker_count=${WORKER_COUNT}, actor_memory=${ACTOR_MEMORY}, mem_target=${MEM_TARGET:-off}, otlp_endpoint=${OTLP_ENDPOINT})..."
   # ActorTemplate.spec has the rule `self == oldSelf` (see
   # pkg/api/v1alpha1/actortemplate_types.go). Thus the API server rejects an
   # apply that changes a template. A value that changes for each run — the OTLP
@@ -176,6 +183,13 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --actor-memory=*)
       ACTOR_MEMORY="${1#*=}"
+      ;;
+    --mem-target)
+      shift
+      MEM_TARGET="$1"
+      ;;
+    --mem-target=*)
+      MEM_TARGET="${1#*=}"
       ;;
     --wait-timeout)
       shift
