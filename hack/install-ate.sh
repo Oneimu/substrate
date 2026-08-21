@@ -108,6 +108,8 @@ function usage() {
   echo "                                         microvm requires hack/install-microvm-deps.sh --install to have run."
   echo "  --benchmark-actor-memory SIZE          Memory limit for the benchmark ActorTemplates (default: 256Mi,"
   echo "                                         the smallest size microvm admits)"
+  echo "  --benchmark-mem-target SIZE            Resident working set glutton holds and keeps re-dirtying"
+  echo "                                         (default: empty = disabled). Size --benchmark-actor-memory above it."
   echo ""
   for demo_name in "${ATE_DEMOS[@]}"; do
     echo "Demo: ${demo_name}"
@@ -905,6 +907,9 @@ deploy_benchmarks() {
   if [[ -n "${BENCHMARK_ACTOR_MEMORY}" ]]; then
     benchmark_args+=(--actor-memory "${BENCHMARK_ACTOR_MEMORY}")
   fi
+  if [[ -n "${BENCHMARK_MEM_TARGET}" ]]; then
+    benchmark_args+=(--mem-target "${BENCHMARK_MEM_TARGET}")
+  fi
   "${ROOT}/benchmarking/deploy_locust.sh" "${benchmark_args[@]}"
 }
 
@@ -951,6 +956,8 @@ BENCHMARK_WORKER_COUNT=1
 BENCHMARK_SANDBOX_CLASS=gvisor
 # Empty keeps the default in benchmarking/workloads/deploy.sh (256Mi).
 BENCHMARK_ACTOR_MEMORY=""
+# Empty keeps the default in benchmarking/workloads/deploy.sh (memload disabled).
+BENCHMARK_MEM_TARGET=""
 prescan_args=("$@")
 for ((i = 0; i < ${#prescan_args[@]}; i++)); do
   case "${prescan_args[i]}" in
@@ -1012,6 +1019,16 @@ for ((i = 0; i < ${#prescan_args[@]}; i++)); do
       ;;
     --benchmark-actor-memory=*)
       BENCHMARK_ACTOR_MEMORY="${prescan_args[i]#*=}"
+      ;;
+    --benchmark-mem-target)
+      if (( i + 1 >= ${#prescan_args[@]} )); then
+        echo "Error: --benchmark-mem-target requires a size (e.g. 1Gi)" >&2
+        exit 1
+      fi
+      BENCHMARK_MEM_TARGET="${prescan_args[$((i + 1))]}"
+      ;;
+    --benchmark-mem-target=*)
+      BENCHMARK_MEM_TARGET="${prescan_args[i]#*=}"
       ;;
     --otlp-endpoint)
       if (( i + 1 >= ${#prescan_args[@]} )); then
@@ -1120,6 +1137,8 @@ while [[ "$#" -gt 0 ]]; do
     --benchmark-sandbox-class=*) ;;
     --benchmark-actor-memory) shift ;;
     --benchmark-actor-memory=*) ;;
+    --benchmark-mem-target) shift ;;
+    --benchmark-mem-target=*) ;;
     --otlp-endpoint) shift ;;
     --otlp-endpoint=*) ;;
 

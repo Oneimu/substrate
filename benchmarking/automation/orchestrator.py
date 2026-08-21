@@ -328,7 +328,10 @@ def teardown_microvm_deps() -> None:
 
 
 def deploy_workloads(
-    worker_count: int = 1, sandbox_class: str = "gvisor", actor_memory: str = ""
+    worker_count: int = 1,
+    sandbox_class: str = "gvisor",
+    actor_memory: str = "",
+    mem_target: str = "",
 ) -> None:
     cmd = [
         "benchmarking/workloads/deploy.sh",
@@ -342,6 +345,10 @@ def deploy_workloads(
     # minimum); RAM-consuming suites set actorMemory in tests.yaml.
     if actor_memory:
         cmd += ["--actor-memory", actor_memory]
+    # Empty keeps glutton's self-driving memory load disabled; large-memory
+    # suites set memTarget in tests.yaml (with actorMemory sized above it).
+    if mem_target:
+        cmd += ["--mem-target", mem_target]
     run(cmd)
     # Block until ActorTemplates are Ready
     run(
@@ -528,6 +535,7 @@ def main() -> None:
                     test.get("workerCount", 1),
                     sandbox_class,
                     test.get("actorMemory", ""),
+                    test.get("memTarget", ""),
                 )
                 try:
                     status = run_test(
