@@ -67,16 +67,23 @@ func startMemLoad(ctx context.Context, target int64, interval time.Duration, pat
 	}
 
 	m := &memLoad{}
+	// Fill with deterministic pseudo-random bytes: a zero-filled working set
+	// compresses ~35:1 under the snapshotter's zstd, shrinking the upload and
+	// download legs of the benchmark to a few MB regardless of --mem-target.
+	// Incompressible content keeps the stored snapshot at roughly target size.
+	fill := rand.New(rand.NewSource(1))
 	for remaining := target; remaining > 0; remaining -= memChunkBytes {
 		size := int64(memChunkBytes)
 		if remaining < size {
 			size = remaining
 		}
-		m.chunks = append(m.chunks, make([]byte, size))
+		c := make([]byte, size)
+		fill.Read(c)
+		m.chunks = append(m.chunks, c)
 	}
 
-	// Initial pass: fault every page in so the working set is resident
-	// before the actor reports ready.
+	// Initial pass: the fill above already faulted every page in; this seeds
+	// the touched counter at one full working set before readyz.
 	m.writePass(1, nil)
 
 	meter := otel.Meter(meterName)
