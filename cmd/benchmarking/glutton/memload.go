@@ -41,6 +41,9 @@ type memLoad struct {
 	chunks  [][]byte
 	touched atomic.Int64 // pages written since start, exported as a counter
 	sweeps  atomic.Int64
+
+	readCursor  atomic.Int64 // next page index for request-coupled reads
+	readCounter metric.Int64Counter
 }
 
 // memChunkBytes bounds single allocations so the target size doesn't have to
@@ -106,6 +109,11 @@ func startMemLoad(ctx context.Context, target int64, interval time.Duration, pat
 		return nil, err
 	}
 	touchCounter.Add(ctx, m.touched.Load())
+	m.readCounter, err = meter.Int64Counter("glutton.memload.request_read_pages",
+		metric.WithDescription("Pages read from the working set to serve requests."))
+	if err != nil {
+		return nil, err
+	}
 
 	go m.sweep(ctx, interval, pattern, touchCounter)
 	return m, nil
@@ -168,6 +176,40 @@ func (m *memLoad) writeRange(start, count int, val byte) {
 			idx++
 		}
 	}
+}
+
+// readPages reads one byte from each of count pages, rotating through the
+// working set across calls so successive requests cover different pages. It
+// exists so request handling can depend on the resident working set: after a
+// restore, these reads pay the cost of bringing pages back, which is what a
+// real application's first responses experience. The returned XOR keeps the
+// reads from being optimized away. Reads land mid-page, away from the byte
+// the sweeper writes at page start, so the two never touch the same word.
+func (m *memLoad) readPages(ctx context.Context, count int) byte {
+	totalPages := 0
+	for _, c := range m.chunks {
+		totalPages += len(c) / pageBytes
+	}
+	if totalPages == 0 || count <= 0 {
+		return 0
+	}
+	start := m.readCursor.Add(int64(count)) - int64(count)
+	var acc byte
+	for i := 0; i < count; i++ {
+		idx := int((start + int64(i)) % int64(totalPages))
+		for _, c := range m.chunks {
+			pages := len(c) / pageBytes
+			if idx < pages {
+				acc ^= c[idx*pageBytes+pageBytes/2]
+				break
+			}
+			idx -= pages
+		}
+	}
+	if m.readCounter != nil {
+		m.readCounter.Add(ctx, int64(count))
+	}
+	return acc
 }
 
 // writeRandom writes val to count uniformly random pages.

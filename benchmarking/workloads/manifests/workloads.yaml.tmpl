@@ -85,6 +85,11 @@ spec:
     # and keeps re-dirtying 1-2GiB, which is what suspend/resume must then
     # snapshot. Size ${ACTOR_MEMORY} with headroom above it.
     - "--mem-target=${MEM_TARGET}"
+    # Request-coupled reads: empty disables them; realistic-workload suites
+    # set e.g. 64Mi so each Ping must read the working set before responding
+    # — after a restore that read pays the cost of bringing pages back, like
+    # a real application's first responses do.
+    - "--mem-read-per-request=${MEM_READ_PER_REQUEST}"
     # Substrate puts no OTLP configuration in an actor container:
     # resolveActorEnv in cmd/atelet/oci.go merges the env of the ActorTemplate
     # and the ENV of the image, and nothing more. Without the value below, the

@@ -333,6 +333,7 @@ def deploy_workloads(
     actor_memory: str = "",
     wait_timeout: str = "",
     mem_target: str = "",
+    mem_read_per_request: str = "",
 ) -> None:
     cmd = [
         "benchmarking/workloads/deploy.sh",
@@ -353,6 +354,10 @@ def deploy_workloads(
     # suites set memTarget in tests.yaml (with actorMemory sized above it).
     if mem_target:
         cmd += ["--mem-target", mem_target]
+    # Empty keeps request-coupled reads disabled; realistic-workload suites
+    # set memReadPerRequest in tests.yaml (requires memTarget).
+    if mem_read_per_request:
+        cmd += ["--mem-read-per-request", mem_read_per_request]
     run(cmd)
     # Block until ActorTemplates are Ready
     run(
@@ -541,6 +546,7 @@ def main() -> None:
                     test.get("actorMemory", ""),
                     test.get("workerWaitTimeout", ""),
                     test.get("memTarget", ""),
+                    test.get("memReadPerRequest", ""),
                 )
                 try:
                     status = run_test(

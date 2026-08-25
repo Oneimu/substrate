@@ -46,6 +46,13 @@
 #                  (--mem-target in cmd/benchmarking/glutton/memload.go), so
 #                  suspend/resume is measured against a realistically-sized
 #                  actor. Size actorMemory above it for headroom.
+#   memReadPerRequest
+#                  Optional (default "" = disabled). How much of the memTarget
+#                  working set glutton reads to serve each Ping
+#                  (--mem-read-per-request), so request latency includes the
+#                  cost of touching resident memory — after a restore, that
+#                  read pays for bringing pages back, like a real
+#                  application's first responses. Requires memTarget.
 #   ateArgs        Optional. List of strings appended verbatim to
 #                  `hack/install-ate.sh --deploy-ate-system` when this
 #                  test's substrate is deployed (e.g. ["--atenet-router=agentgateway"]
@@ -111,6 +118,7 @@ tests:
     workerCount: 1
     actorMemory: "1536Mi"
     memTarget: "1Gi"
+    memReadPerRequest: "64Mi"
     flags:
       - "--min-wait-time"
       - "1.0"
@@ -127,6 +135,7 @@ tests:
     sandboxClass: microvm
     actorMemory: "1536Mi"
     memTarget: "1Gi"
+    memReadPerRequest: "64Mi"
     flags:
       - "--min-wait-time"
       - "1.0"
@@ -142,6 +151,7 @@ tests:
     workerCount: 1
     actorMemory: "2560Mi"
     memTarget: "2Gi"
+    memReadPerRequest: "64Mi"
     flags:
       - "--min-wait-time"
       - "1.0"
@@ -158,6 +168,7 @@ tests:
     sandboxClass: microvm
     actorMemory: "2560Mi"
     memTarget: "2Gi"
+    memReadPerRequest: "64Mi"
     flags:
       - "--min-wait-time"
       - "1.0"

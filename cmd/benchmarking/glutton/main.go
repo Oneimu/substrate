@@ -67,6 +67,8 @@ var (
 	memTouchInterval = pflag.Duration("mem-touch-interval", 10*time.Second, "Duration of one full re-dirtying pass over the --mem-target working set.")
 	memPattern       = pflag.String("mem-pattern", "sequential", "Page-touch order for the memload sweeper: sequential or random.")
 
+	memReadPerRequest = pflag.String("mem-read-per-request", "", "If set (e.g. 64Mi), each Ping reads this much of the --mem-target working set (one byte per page) before responding, so request latency includes the cost of touching resident memory. Requires --mem-target.")
+
 	showVersion = pflag.Bool("version", false, "Print version and exit.")
 )
 
@@ -109,6 +111,9 @@ func main() {
 	}
 	defer svc.Close()
 
+	if *memReadPerRequest != "" && *memTarget == "" {
+		serverboot.Fatal(ctx, "Invalid --mem-read-per-request", fmt.Errorf("requires --mem-target"))
+	}
 	if *memTarget != "" {
 		target, err := parseBytes(*memTarget)
 		if err != nil {
@@ -117,10 +122,25 @@ func main() {
 		// Started before the listener so the working set is resident by the
 		// time readyz answers: benchmarks that wait for Ready measure an
 		// actor already at size.
-		if _, err := startMemLoad(ctx, target, *memTouchInterval, *memPattern); err != nil {
+		m, err := startMemLoad(ctx, target, *memTouchInterval, *memPattern)
+		if err != nil {
 			serverboot.Fatal(ctx, "Failed to start memload", err)
 		}
 		logMemLoadStart(ctx, target, *memTouchInterval, *memPattern)
+		if *memReadPerRequest != "" {
+			readBytes, err := parseBytes(*memReadPerRequest)
+			if err == nil && readBytes <= 0 {
+				err = fmt.Errorf("must be positive, got %d", readBytes)
+			}
+			if err != nil {
+				serverboot.Fatal(ctx, "Invalid --mem-read-per-request", err)
+			}
+			svc.memRead = m
+			svc.memReadPages = int((readBytes + pageBytes - 1) / pageBytes)
+			slog.InfoContext(ctx, "memload request reads enabled",
+				slog.Int64("read_bytes_per_request", readBytes),
+				slog.Int("read_pages_per_request", svc.memReadPages))
+		}
 	}
 
 	lis, err := net.Listen("tcp", *listenAddr)
@@ -277,6 +297,11 @@ type gluttonService struct {
 	ram   map[string][]byte
 	fds   []*os.File
 	peers map[string]*peerGossip
+
+	// memRead, when non-nil, makes Ping read memReadPages pages of the
+	// memload working set before responding (--mem-read-per-request).
+	memRead      *memLoad
+	memReadPages int
 
 	ramWriteBytes  metric.Int64Counter
 	diskWriteBytes metric.Int64Counter
@@ -561,6 +586,9 @@ func (s *gluttonService) OpenFD(_ context.Context, req *glutton.OpenFDRequest) (
 // Receive a ping request, echoing the same response back.
 func (s *gluttonService) Ping(ctx context.Context, req *glutton.PingRequest) (*glutton.PingResponse, error) {
 	s.pingsReceived.Add(ctx, 1)
+	if s.memRead != nil {
+		s.memRead.readPages(ctx, s.memReadPages)
+	}
 	return &glutton.PingResponse{Message: req.GetMessage()}, nil
 }
 

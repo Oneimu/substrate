@@ -18,6 +18,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/agent-substrate/substrate/internal/proto/glutton"
 )
 
 func TestParseBytes(t *testing.T) {
@@ -102,6 +104,74 @@ func TestMemLoadSweeperKeepsTouching(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("sweeper made no progress: touched stuck at %d", after)
+}
+
+func TestReadPagesRotatesThroughWorkingSet(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	m, err := startMemLoad(ctx, 1<<20, time.Hour, "sequential")
+	if err != nil {
+		t.Fatalf("startMemLoad: %v", err)
+	}
+
+	m.readPages(ctx, 10)
+	m.readPages(ctx, 10)
+	if got := m.readCursor.Load(); got != 20 {
+		t.Errorf("readCursor after two reads of 10 = %d, want 20", got)
+	}
+	// More pages than the set holds: the cursor wraps rather than faulting.
+	pages := (1 << 20) / pageBytes
+	m.readPages(ctx, pages*3)
+	if got := m.readCursor.Load(); got != int64(20+pages*3) {
+		t.Errorf("readCursor after wrap read = %d, want %d", got, 20+pages*3)
+	}
+
+	if got := m.readPages(ctx, 0); got != 0 {
+		t.Errorf("readPages(0) = %d, want 0", got)
+	}
+}
+
+func TestReadPagesConcurrentWithSweeper(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Short interval keeps the sweeper writing while we read; run under
+	// -race this verifies request reads and sweeper writes never touch the
+	// same word.
+	m, err := startMemLoad(ctx, 1<<20, 20*time.Millisecond, "sequential")
+	if err != nil {
+		t.Fatalf("startMemLoad: %v", err)
+	}
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		m.readPages(ctx, 64)
+	}
+}
+
+func TestPingReadsWorkingSetWhenConfigured(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	svc, err := newGluttonService(t.TempDir())
+	if err != nil {
+		t.Fatalf("newGluttonService: %v", err)
+	}
+	defer svc.Close()
+
+	m, err := startMemLoad(ctx, 1<<20, time.Hour, "sequential")
+	if err != nil {
+		t.Fatalf("startMemLoad: %v", err)
+	}
+	svc.memRead = m
+	svc.memReadPages = 16
+
+	if _, err := svc.Ping(ctx, &glutton.PingRequest{Message: "hi"}); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	if got := m.readCursor.Load(); got != 16 {
+		t.Errorf("readCursor after one Ping = %d, want 16", got)
+	}
 }
 
 func TestStartMemLoadRejectsBadInputs(t *testing.T) {
