@@ -109,6 +109,12 @@ func TestStartMemLoadRejectsBadInputs(t *testing.T) {
 	if _, err := startMemLoad(ctx, 0, time.Second, "sequential"); err == nil {
 		t.Error("startMemLoad(0 bytes) succeeded, want error")
 	}
+	if _, err := startMemLoad(ctx, 1<<20, -time.Second, "sequential"); err == nil {
+		t.Error("startMemLoad(negative interval) succeeded, want error")
+	}
+	if _, err := startMemLoad(ctx, 1<<20, 0, "sequential"); err == nil {
+		t.Error("startMemLoad(zero interval) succeeded, want error")
+	}
 	if _, err := startMemLoad(ctx, 1<<20, time.Second, "zigzag"); err == nil {
 		t.Error("startMemLoad(pattern=zigzag) succeeded, want error")
 	}

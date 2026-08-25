@@ -60,6 +60,11 @@ func startMemLoad(ctx context.Context, target int64, interval time.Duration, pat
 	if target <= 0 {
 		return nil, fmt.Errorf("mem-target must be positive, got %d", target)
 	}
+	// The sweeper's ticker fires at interval/batches; time.NewTicker panics
+	// on non-positive durations.
+	if interval <= 0 {
+		return nil, fmt.Errorf("mem-touch-interval must be positive, got %v", interval)
+	}
 	switch pattern {
 	case "sequential", "random":
 	default:
