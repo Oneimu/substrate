@@ -54,6 +54,11 @@ const (
 	templateNS   = "benchmark-workloads"
 	actorDomain  = "actors.resources.substrate.ate.dev"
 	pingPath     = "/ping"
+	writeRAMPath = "/writeram"
+
+	// ramChunkBytes bounds one WriteRAM call: the proto size field is int32,
+	// so a >2GiB target must arrive as several keyed allocations.
+	ramChunkBytes = 64 << 20
 
 	sourceClient = "client"
 	sourceServer = "server"
@@ -106,6 +111,10 @@ func (r *taskRuntime) iterate() {
 	if !user.resume(ctx) {
 		return
 	}
+	// Fill before the first suspend so every snapshot from cycle one on
+	// carries the full working set; glutton keeps the allocations across
+	// suspend/resume, so this runs once per actor (retried if it fails).
+	user.ensureRAMFilled(ctx)
 	user.ping(ctx)
 	user.suspend(ctx)
 
@@ -162,6 +171,7 @@ type gluttonUser struct {
 	hostHeader   string
 	firstResume  bool
 	actorRunning bool
+	ramFilled    bool
 }
 
 func (u *gluttonUser) ref() *ateapipb.ObjectRef {
@@ -325,6 +335,83 @@ func (u *gluttonUser) ping(ctx context.Context) {
 	}
 	logSampledTrace(span, "GluttonPing", clientLatency, sourceClient, nil)
 	bmetrics.RecordSuccess("http", "GluttonPing", userClass, clientLatency, int64(len(respBody)))
+}
+
+// ensureRAMFilled grows the actor's resident working set to the configured
+// mem_target_bytes through the glutton WriteRAM API, one keyed chunk per
+// call (the proto size field is int32). Runs once per actor: glutton holds
+// the allocations for its lifetime, so they persist across suspend/resume
+// and every snapshot from the first suspend onward is at size. A failed
+// chunk aborts the fill; the next iteration retries from the top (TRUNCATE
+// writes make re-sent chunks idempotent in size). The whole fill reports as
+// one GluttonFillRAM stats row so it never pollutes ping or resume numbers.
+func (u *gluttonUser) ensureRAMFilled(ctx context.Context) {
+	if u.ramFilled {
+		return
+	}
+	target := u.cfg.Dyn.Load().MemTargetBytes
+	if target <= 0 {
+		u.ramFilled = true
+		return
+	}
+
+	ctx, span := u.cfg.Tracer.Start(ctx, "GluttonFillRAM")
+	defer span.End()
+	start := time.Now()
+
+	var chunk int
+	for remaining := target; remaining > 0; chunk++ {
+		size := int64(ramChunkBytes)
+		if remaining < size {
+			size = remaining
+		}
+		if err := u.writeRAMChunk(ctx, fmt.Sprintf("memload-%d", chunk), int32(size)); err != nil {
+			clientLatency := time.Since(start)
+			logSampledTrace(span, "GluttonFillRAM", clientLatency, sourceClient, err)
+			bmetrics.RecordFailure("http", "GluttonFillRAM", userClass, clientLatency, err.Error())
+			return
+		}
+		remaining -= size
+	}
+
+	u.ramFilled = true
+	clientLatency := time.Since(start)
+	logSampledTrace(span, "GluttonFillRAM", clientLatency, sourceClient, nil)
+	bmetrics.RecordSuccess("http", "GluttonFillRAM", userClass, clientLatency, target)
+}
+
+// writeRAMChunk POSTs one WriteRAM allocation to the actor through the
+// router, mirroring ping's wire format (protobuf over HTTP).
+func (u *gluttonUser) writeRAMChunk(ctx context.Context, key string, size int32) error {
+	body, err := proto.Marshal(&gluttonpb.WriteRAMRequest{
+		Key:       key,
+		Size:      size,
+		WriteMode: gluttonpb.WriteMode_WRITE_MODE_TRUNCATE,
+	})
+	if err != nil {
+		return err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u.cfg.RouterURL+writeRAMPath, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Host = u.hostHeader
+	httpReq.Header.Set("Content-Type", "application/x-protobuf")
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
+
+	resp, err := u.cfg.HTTPClient.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("WriteRAM %s (%d bytes): HTTP %d: %s", key, size, resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return nil
 }
 
 // logSampledTrace emits a single structured line per sampled span. Operators

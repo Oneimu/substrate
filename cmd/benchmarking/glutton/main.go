@@ -63,10 +63,6 @@ var (
 	dataDir           = pflag.String("data-dir", "", "Directory under which WriteDisk files are stored. Required.")
 	mode              = pflag.String("mode", "grpc", "Wire protocol for the main listener: grpc (default) or http.")
 
-	memTarget        = pflag.String("mem-target", "", "If set (e.g. 512Mi, 2Gi), allocate this much memory at startup and keep re-dirtying it, so the actor holds a resident working set without needing the gRPC API (see memload.go).")
-	memTouchInterval = pflag.Duration("mem-touch-interval", 10*time.Second, "Duration of one full re-dirtying pass over the --mem-target working set.")
-	memPattern       = pflag.String("mem-pattern", "sequential", "Page-touch order for the memload sweeper: sequential or random.")
-
 	showVersion = pflag.Bool("version", false, "Print version and exit.")
 )
 
@@ -108,20 +104,6 @@ func main() {
 		serverboot.Fatal(ctx, "Failed to construct glutton service", err)
 	}
 	defer svc.Close()
-
-	if *memTarget != "" {
-		target, err := parseBytes(*memTarget)
-		if err != nil {
-			serverboot.Fatal(ctx, "Invalid --mem-target", err)
-		}
-		// Started before the listener so the working set is resident by the
-		// time readyz answers: benchmarks that wait for Ready measure an
-		// actor already at size.
-		if _, err := startMemLoad(ctx, target, *memTouchInterval, *memPattern); err != nil {
-			serverboot.Fatal(ctx, "Failed to start memload", err)
-		}
-		logMemLoadStart(ctx, target, *memTouchInterval, *memPattern)
-	}
 
 	lis, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
@@ -203,6 +185,10 @@ func newMux(svc *gluttonService) *http.ServeMux {
 	mux.HandleFunc("/ping", protoRoute("Ping", svc.Ping))
 	mux.HandleFunc("/writedisk", protoRoute("WriteDisk", svc.WriteDisk))
 	mux.HandleFunc("/readdisk", protoRoute("ReadDisk", svc.ReadDisk))
+	// WriteRAM is how benchmark drivers give an actor a resident working set
+	// in http mode: the boomer GluttonUser fills to its configured target so
+	// suspend/resume runs against realistically-sized memory.
+	mux.HandleFunc("/writeram", protoRoute("WriteRAM", svc.WriteRAM))
 	return mux
 }
 

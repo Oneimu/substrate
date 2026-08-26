@@ -31,8 +31,6 @@ SKIP_BUILD=0
 OTLP_ENDPOINT=""
 # Empty keeps the default in workloads/deploy.sh (256Mi, the microvm minimum).
 ACTOR_MEMORY=""
-# Empty keeps the default in workloads/deploy.sh (memload disabled).
-MEM_TARGET=""
 WAIT_TIMEOUT=""
 
 usage() {
@@ -48,8 +46,6 @@ usage() {
   echo "                          instrumented actor container sends telemetry."
   echo "  --actor-memory SIZE     Forwarded to workloads/deploy.sh. Memory limit for the"
   echo "                          benchmark ActorTemplates (default: 256Mi, the microvm minimum)."
-  echo "  --mem-target SIZE       Forwarded to workloads/deploy.sh. Resident working set glutton"
-  echo "                          holds and keeps re-dirtying (default: empty = disabled)."
   echo "  --wait-timeout DURATION Forwarded to workloads/deploy.sh. The timeout for waiting"
   echo "                          for the ateom workers to be ready (default: 300s)"
   echo "  --skip-build            Skip locust image build/push (use the existing :latest image)"
@@ -78,8 +74,6 @@ while [[ "$#" -gt 0 ]]; do
     --otlp-endpoint=*) OTLP_ENDPOINT="${1#*=}" ;;
     --actor-memory) shift; ACTOR_MEMORY="$1" ;;
     --actor-memory=*) ACTOR_MEMORY="${1#*=}" ;;
-    --mem-target) shift; MEM_TARGET="$1" ;;
-    --mem-target=*) MEM_TARGET="${1#*=}" ;;
     --wait-timeout) shift; WAIT_TIMEOUT="$1" ;;
     --wait-timeout=*) WAIT_TIMEOUT="${1#*=}" ;;
     --skip-build) SKIP_BUILD=1 ;;
@@ -117,9 +111,6 @@ if [[ "${action}" == "deploy" ]]; then
   fi
   if [[ -n "${ACTOR_MEMORY}" ]]; then
     workload_args+=(--actor-memory "${ACTOR_MEMORY}")
-  fi
-  if [[ -n "${MEM_TARGET}" ]]; then
-    workload_args+=(--mem-target "${MEM_TARGET}")
   fi
   if [[ -n "${WAIT_TIMEOUT}" ]]; then
     workload_args+=(--wait-timeout "${WAIT_TIMEOUT}")

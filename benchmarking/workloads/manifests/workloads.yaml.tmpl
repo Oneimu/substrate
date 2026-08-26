@@ -80,11 +80,6 @@ spec:
     - "--metrics-listen-addr=:9090"
     - "--data-dir=/tmp/glutton"
     - "--mode=http"
-    # Self-driving resident working set (cmd/benchmarking/glutton/memload.go):
-    # empty disables it; large-memory suites set it so the actor truly holds
-    # and keeps re-dirtying 1-2GiB, which is what suspend/resume must then
-    # snapshot. Size ${ACTOR_MEMORY} with headroom above it.
-    - "--mem-target=${MEM_TARGET}"
     # Substrate puts no OTLP configuration in an actor container:
     # resolveActorEnv in cmd/atelet/oci.go merges the env of the ActorTemplate
     # and the ENV of the image, and nothing more. Without the value below, the
