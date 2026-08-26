@@ -100,6 +100,7 @@ const (
 	SnapshotKindKey         = attribute.Key("ate.snapshot.kind")
 	SnapshotScopeKey        = attribute.Key("ate.snapshot.scope")
 	SnapshotPhaseKey        = attribute.Key("ate.snapshot.phase")
+	SnapshotBytesKindKey    = attribute.Key("ate.snapshot.bytes.kind")
 	ImageCacheOutcomeKey    = attribute.Key("ate.imagecache.outcome")
 	SchedulerOutcomeKey     = attribute.Key("ate.scheduler.outcome")
 	SchedulingConstraintKey = attribute.Key("ate.scheduling.constraint")
@@ -260,6 +261,18 @@ const (
 	// for local); SnapshotKindKey already says which.
 	SnapshotPhasePersist = "persist"
 	SnapshotPhaseTotal   = "total"
+)
+
+// Values for SnapshotBytesKindKey: the layer at which one snapshot-file
+// transfer observation counts its bytes. The three kinds measure the same
+// transfer, so rollups must group by this key rather than sum across it.
+const (
+	// SnapshotBytesKindLogical is the file's apparent size, holes included.
+	SnapshotBytesKindLogical = "logical"
+	// SnapshotBytesKindPopulated is the non-hole bytes actually read or written.
+	SnapshotBytesKindPopulated = "populated"
+	// SnapshotBytesKindWire is the compressed bytes on the wire.
+	SnapshotBytesKindWire = "wire"
 )
 
 // FailureReason classifies err onto the bounded ateerrors taxonomy, reading the

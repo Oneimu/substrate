@@ -91,7 +91,7 @@ func TestSparseZstdRoundTrip(t *testing.T) {
 			defer src.Close()
 
 			var buf bytes.Buffer
-			logical, _, err := writeSparseZstd(&buf, src)
+			logical, dataBytes, err := writeSparseZstd(&buf, src)
 			if err != nil {
 				t.Fatalf("writeSparseZstd: %v", err)
 			}
@@ -108,12 +108,18 @@ func TestSparseZstdRoundTrip(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer dst.Close()
-			size, err := readSparseZstd(dst, bytes.NewReader(buf.Bytes()[len(sparseMagic):]))
+			size, written, err := readSparseZstd(dst, bytes.NewReader(buf.Bytes()[len(sparseMagic):]))
 			if err != nil {
 				t.Fatalf("readSparseZstd: %v", err)
 			}
 			if size != tc.size {
 				t.Errorf("readSparseZstd size=%d, want %d", size, tc.size)
+			}
+			// The reader replays exactly the extent bytes the writer fed in
+			// (fs-independent, unlike the declared regions, which the fs may
+			// round up to blocks or not make sparse at all).
+			if written != dataBytes {
+				t.Errorf("readSparseZstd written=%d, want %d (writeSparseZstd's dataBytes)", written, dataBytes)
 			}
 
 			want, err := os.ReadFile(srcPath)
@@ -204,7 +210,7 @@ func TestReadSparseZstdRejectsMalformed(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer dst.Close()
-			_, err = readSparseZstd(dst, bytes.NewReader(tc.stream))
+			_, _, err = readSparseZstd(dst, bytes.NewReader(tc.stream))
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tc.want)
 			}
@@ -226,7 +232,7 @@ func TestReadSparseZstdTruncated(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dst.Close()
-	if _, err := readSparseZstd(dst, bytes.NewReader(stream)); err == nil {
+	if _, _, err := readSparseZstd(dst, bytes.NewReader(stream)); err == nil {
 		t.Fatal("expected an error for a stream missing its end sentinel, got nil")
 	}
 }

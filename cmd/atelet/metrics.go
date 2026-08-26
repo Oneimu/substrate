@@ -21,6 +21,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 
 	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
@@ -30,6 +31,8 @@ import (
 const (
 	restoreDurationMetric    = "ate.actor.restore.duration"
 	checkpointDurationMetric = "ate.actor.checkpoint.duration"
+	transferDurationMetric   = "atelet.snapshot.transfer.duration"
+	transferSizeMetric       = "atelet.snapshot.transfer.size"
 )
 
 // snapshotPhaseBuckets have to cover both ends of a phase breakdown: a warm OCI
@@ -37,11 +40,18 @@ const (
 // fetching a multi-GiB snapshot runs for tens of seconds.
 var snapshotPhaseBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60}
 
+// snapshotTransferSizeBuckets are the atelet.snapshot.size buckets extended
+// downward: one transfer observation can be a multi-GiB memory image's logical
+// size or a kilobyte manifest's wire size.
+var snapshotTransferSizeBuckets = []float64{1e4, 1e5, 1e6, 5e6, 1e7, 2.5e7, 5e7, 1e8, 2.5e8, 5e8, 1e9, 2e9, 5e9, 1e10}
+
 // Instruments holds atelet's cold-start histograms. A nil *Instruments is a
 // valid no-op, so call sites need no guard.
 type Instruments struct {
 	restoreDuration    metric.Float64Histogram
 	checkpointDuration metric.Float64Histogram
+	transferDuration   metric.Float64Histogram
+	transferSize       metric.Int64Histogram
 }
 
 func NewInstruments(meter metric.Meter) (*Instruments, error) {
@@ -65,9 +75,31 @@ func NewInstruments(meter metric.Meter) (*Instruments, error) {
 		return nil, fmt.Errorf("create %s histogram: %w", checkpointDurationMetric, err)
 	}
 
+	transferDuration, err := meter.Float64Histogram(
+		transferDurationMetric,
+		metric.WithUnit("s"),
+		metric.WithDescription("Duration of one snapshot file's transfer to or from object storage."),
+		metric.WithExplicitBucketBoundaries(snapshotPhaseBuckets...),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create %s histogram: %w", transferDurationMetric, err)
+	}
+
+	transferSize, err := meter.Int64Histogram(
+		transferSizeMetric,
+		metric.WithUnit("By"),
+		metric.WithDescription("Bytes of one snapshot file's transfer, one observation per ate.snapshot.bytes.kind value: logical (apparent size, holes included), populated (non-hole bytes read or written), and wire (compressed bytes on the wire)."),
+		metric.WithExplicitBucketBoundaries(snapshotTransferSizeBuckets...),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create %s histogram: %w", transferSizeMetric, err)
+	}
+
 	return &Instruments{
 		restoreDuration:    restoreDuration,
 		checkpointDuration: checkpointDuration,
+		transferDuration:   transferDuration,
+		transferSize:       transferSize,
 	}, nil
 }
 
@@ -121,6 +153,42 @@ func (i *Instruments) recordCheckpoint(ctx context.Context, op snapshotOp, err e
 		return
 	}
 	recordPhases(ctx, i.checkpointDuration, op, err, phases)
+}
+
+// recordTransfer records one snapshot file moving to (persist) or from
+// (download) object storage: the duration once, and the size once per byte
+// kind so a benchmark can tell which file dominates a phase and how much the
+// compression and the hole-skipping save. A negative size means the caller
+// does not know that count and is skipped; zero is a real observation. The
+// identity is the template's, like every atelet metric label — never the
+// actor's.
+func (i *Instruments) recordTransfer(ctx context.Context, templateNamespace, templateName, fileName, phaseName string, d time.Duration, logical, populated, wire int64) {
+	if i == nil || i.transferDuration == nil || i.transferSize == nil {
+		return
+	}
+	base := []attribute.KeyValue{
+		ateattr.TemplateNamespaceKey.String(templateNamespace),
+		ateattr.TemplateNameKey.String(templateName),
+		ateattr.SnapshotPhaseKey.String(phaseName),
+		semconv.FileNameKey.String(fileName),
+	}
+	i.transferDuration.Record(ctx, d.Seconds(), metric.WithAttributes(base...))
+	for _, kind := range []struct {
+		name string
+		n    int64
+	}{
+		{ateattr.SnapshotBytesKindLogical, logical},
+		{ateattr.SnapshotBytesKindPopulated, populated},
+		{ateattr.SnapshotBytesKindWire, wire},
+	} {
+		if kind.n < 0 {
+			continue
+		}
+		attrs := make([]attribute.KeyValue, 0, len(base)+1)
+		attrs = append(attrs, base...)
+		attrs = append(attrs, ateattr.SnapshotBytesKindKey.String(kind.name))
+		i.transferSize.Record(ctx, kind.n, metric.WithAttributes(attrs...))
+	}
 }
 
 // recordPhases skips zero-valued phases: those never started, because the

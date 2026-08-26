@@ -24,6 +24,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 
 	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/ateerrors"
@@ -447,4 +448,119 @@ func TestCheckpointSnapshotKind(t *testing.T) {
 			}
 		})
 	}
+}
+
+// transferPoints returns the size datapoints of one collect keyed by bytes
+// kind, plus the duration datapoint count.
+func transferPoints(t *testing.T, reader *sdkmetric.ManualReader) (sizes map[string]metricdata.HistogramDataPoint[int64], durations int) {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	sizes = map[string]metricdata.HistogramDataPoint[int64]{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			switch m.Name {
+			case transferSizeMetric:
+				hist, ok := m.Data.(metricdata.Histogram[int64])
+				if !ok {
+					t.Fatalf("%s is %T, want an int64 histogram", m.Name, m.Data)
+				}
+				for _, dp := range hist.DataPoints {
+					v, ok := dp.Attributes.Value(ateattr.SnapshotBytesKindKey)
+					if !ok {
+						t.Errorf("size datapoint without a bytes kind: %v", dp.Attributes.ToSlice())
+						continue
+					}
+					sizes[v.AsString()] = dp
+				}
+			case transferDurationMetric:
+				hist, ok := m.Data.(metricdata.Histogram[float64])
+				if !ok {
+					t.Fatalf("%s is %T, want a float64 histogram", m.Name, m.Data)
+				}
+				durations = len(hist.DataPoints)
+			}
+		}
+	}
+	return sizes, durations
+}
+
+func TestRecordTransferShape(t *testing.T) {
+	inst, reader := newTestInstruments(t)
+
+	inst.recordTransfer(context.Background(), testTemplateNamespace, testTemplateName,
+		"memory-ranges", ateattr.SnapshotPhasePersist, 2*time.Second,
+		2<<30, 300<<20, 120<<20)
+
+	sizes, durations := transferPoints(t, reader)
+	if durations != 1 {
+		t.Errorf("recorded %d duration datapoints, want 1", durations)
+	}
+	wantSizes := map[string]int64{
+		ateattr.SnapshotBytesKindLogical:   2 << 30,
+		ateattr.SnapshotBytesKindPopulated: 300 << 20,
+		ateattr.SnapshotBytesKindWire:      120 << 20,
+	}
+	if len(sizes) != len(wantSizes) {
+		t.Fatalf("recorded %d size kinds, want %d: %v", len(sizes), len(wantSizes), sizes)
+	}
+	for kind, want := range wantSizes {
+		dp, ok := sizes[kind]
+		if !ok {
+			t.Errorf("bytes kind %q missing", kind)
+			continue
+		}
+		if dp.Sum != want {
+			t.Errorf("%s sum = %d, want %d", kind, dp.Sum, want)
+		}
+		for _, tc := range []struct {
+			key  attribute.Key
+			want string
+		}{
+			{ateattr.TemplateNamespaceKey, testTemplateNamespace},
+			{ateattr.TemplateNameKey, testTemplateName},
+			{ateattr.SnapshotPhaseKey, ateattr.SnapshotPhasePersist},
+			{semconv.FileNameKey, "memory-ranges"},
+		} {
+			if v := attrString(t, dp.Attributes, tc.key); v != tc.want {
+				t.Errorf("%s: %s = %q, want %q", kind, tc.key, v, tc.want)
+			}
+		}
+		if _, ok := dp.Attributes.Value(ateattr.ActorNameKey); ok {
+			t.Error("actor identity must never reach a metric datapoint")
+		}
+	}
+}
+
+// TestRecordTransferSkipsUnknownSizes keeps "the caller could not count this"
+// (negative) out of the histogram while keeping zero, which is a real
+// observation (an empty file transfers zero bytes).
+func TestRecordTransferSkipsUnknownSizes(t *testing.T) {
+	inst, reader := newTestInstruments(t)
+
+	inst.recordTransfer(context.Background(), testTemplateNamespace, testTemplateName,
+		"durable-dir.tar", ateattr.SnapshotPhaseDownload, time.Second,
+		4096, -1, 0)
+
+	sizes, _ := transferPoints(t, reader)
+	if _, ok := sizes[ateattr.SnapshotBytesKindPopulated]; ok {
+		t.Error("a negative (unknown) populated count was recorded")
+	}
+	wire, ok := sizes[ateattr.SnapshotBytesKindWire]
+	if !ok {
+		t.Fatal("a zero wire count is a real observation and must be recorded")
+	}
+	if wire.Sum != 0 {
+		t.Errorf("wire sum = %d, want 0", wire.Sum)
+	}
+}
+
+// TestRecordTransferNilInstruments is the no-op contract for hand-built
+// services with no meter.
+func TestRecordTransferNilInstruments(t *testing.T) {
+	var inst *Instruments
+	inst.recordTransfer(context.Background(), testTemplateNamespace, testTemplateName,
+		"memory-ranges", ateattr.SnapshotPhaseDownload, time.Second, 1, 1, 1)
 }

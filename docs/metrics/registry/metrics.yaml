@@ -242,6 +242,26 @@ groups:
               stability: development
               value: total
               brief: The full operation. Use this value as the denominator. Do not add the phases together.
+      - id: ate.snapshot.bytes.kind
+        stability: development
+        brief: >
+          The layer at which one snapshot-file transfer observation counts its
+          bytes. The three kinds measure the same transfer. Thus group by this
+          key. Do not sum across it.
+        type:
+          members:
+            - id: logical
+              stability: development
+              value: logical
+              brief: The apparent size of the file, holes included.
+            - id: populated
+              stability: development
+              value: populated
+              brief: The bytes that are not holes. These are the bytes the transfer read or wrote on disk.
+            - id: wire
+              stability: development
+              value: wire
+              brief: The compressed bytes on the wire.
 
   - id: registry.ate.failure
     type: attribute_group
@@ -852,6 +872,71 @@ groups:
       - ref: ate.template.namespace
         requirement_level: required
       - ref: ate.template.name
+        requirement_level: required
+
+  - id: metric.atelet.snapshot.transfer.duration
+    type: metric
+    metric_name: atelet.snapshot.transfer.duration
+    instrument: histogram
+    unit: s
+    stability: development
+    brief: The time of one snapshot file's transfer to or from object storage.
+    note: >
+      atelet records one measurement for each file of a snapshot, on the
+      upload of a checkpoint and on the download of a restore. The files of
+      one snapshot transfer at the same time, so the observations do not add
+      up to the download or persist phase of the ate.actor histograms. Pair
+      this instrument with the wire kind of atelet.snapshot.transfer.size to
+      compute the throughput of each file.
+    annotations:
+      substrate:
+        emitted_by: [atelet]
+        golden_signals: [latency]
+        code_anchor: cmd/atelet/metrics.go
+        buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60]
+        cuj: The download phase is slow. Is the cause the memory image or the durable-dir tar?
+    attributes:
+      - ref: file.name
+        requirement_level: required
+      - ref: ate.template.namespace
+        requirement_level: required
+      - ref: ate.template.name
+        requirement_level: required
+      - ref: ate.snapshot.phase
+        requirement_level: required
+        note: Only the download and persist values occur on this instrument.
+
+  - id: metric.atelet.snapshot.transfer.size
+    type: metric
+    metric_name: atelet.snapshot.transfer.size
+    instrument: histogram
+    unit: By
+    stability: development
+    brief: The bytes of one snapshot file's transfer, one observation for each byte kind.
+    note: >
+      For each transferred file atelet records the logical size, the populated
+      (non-hole) bytes, and the compressed wire bytes. Group by the
+      ate.snapshot.bytes.kind key. Do not sum across it. The ratio of
+      populated to logical shows how sparse the memory image is. The ratio of
+      wire to populated shows what the compression saves.
+    annotations:
+      substrate:
+        emitted_by: [atelet]
+        golden_signals: [saturation]
+        code_anchor: cmd/atelet/metrics.go
+        buckets: [10000, 100000, 1000000, 5000000, 10000000, 25000000, 50000000, 100000000, 250000000, 500000000, 1000000000, 2000000000, 5000000000, 10000000000]
+        cuj: How many bytes does each snapshot file put on the wire, and at which actor shape?
+    attributes:
+      - ref: file.name
+        requirement_level: required
+      - ref: ate.template.namespace
+        requirement_level: required
+      - ref: ate.template.name
+        requirement_level: required
+      - ref: ate.snapshot.phase
+        requirement_level: required
+        note: Only the download and persist values occur on this instrument.
+      - ref: ate.snapshot.bytes.kind
         requirement_level: required
 
   - id: metric.ate.actor.stats.cpu.time

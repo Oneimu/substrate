@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 
 	"cloud.google.com/go/storage"
 	"golang.org/x/sync/errgroup"
@@ -42,28 +43,28 @@ const partWriterChunk = 16 << 20
 // The parts are consecutive byte ranges of the same sparse-extent stream — part 0
 // carries the header, the last carries the end sentinel — so the composed object is
 // exactly what the single-stream writer would have produced.
-func (g *gcsClient) PutSparseFile(ctx context.Context, bucket, object string, f *os.File) (res writeContentResult, err error) {
+func (g *gcsClient) PutSparseFile(ctx context.Context, bucket, object string, f *os.File) (stats UploadStats, err error) {
 	fi, err := f.Stat()
 	if err != nil {
-		return res, err
+		return stats, err
 	}
 	size := fi.Size()
 	exts, populated, err := sparseExtents(f, size)
 	if err != nil {
-		return res, err
+		return stats, err
 	}
-	res = writeContentResult{logicalBytes: size, populatedBytes: populated, sparse: true}
+	stats = UploadStats{LogicalBytes: size, PopulatedBytes: populated, Sparse: true}
 
 	n := sparsePartCount(populated)
 	if n < 2 {
 		// Too small to be worth splitting; the plain streaming path handles it.
-		return res, errSparseTooSmall
+		return stats, errSparseTooSmall
 	}
 	groups := planSparseParts(exts, populated, n)
 
 	var idBytes [8]byte
 	if _, err := rand.Read(idBytes[:]); err != nil {
-		return res, fmt.Errorf("while naming upload parts: %w", err)
+		return stats, fmt.Errorf("while naming upload parts: %w", err)
 	}
 	runID := hex.EncodeToString(idBytes[:])
 
@@ -81,6 +82,9 @@ func (g *gcsClient) PutSparseFile(ctx context.Context, bucket, object string, f 
 		}
 	}()
 
+	// The parts are consecutive ranges of one compressed stream, so the bytes
+	// handed to the part writers sum to the composed object's (wire) size.
+	var wire atomic.Int64
 	grp, gctx := errgroup.WithContext(ctx)
 	for i, ranges := range groups {
 		grp.Go(func() error {
@@ -88,7 +92,7 @@ func (g *gcsClient) PutSparseFile(ctx context.Context, bucket, object string, f 
 			obj := g.uploadClient(gctx, i).Bucket(bucket).Object(parts[i].ObjectName())
 			w := obj.NewWriter(gctx)
 			w.ChunkSize = partWriterChunk
-			if err := writeSparsePart(w, f, size, ranges, i == 0, i == len(groups)-1); err != nil {
+			if err := writeSparsePart(countingWriter{w: w, n: &wire}, f, size, ranges, i == 0, i == len(groups)-1); err != nil {
 				_ = w.Close()
 				return fmt.Errorf("while writing part %d of %q: %w", i, object, err)
 			}
@@ -96,9 +100,10 @@ func (g *gcsClient) PutSparseFile(ctx context.Context, bucket, object string, f 
 		})
 	}
 	if err := grp.Wait(); err != nil {
-		return res, err
+		return stats, err
 	}
-	return res, composeAll(ctx, bkt, object, parts, runID)
+	stats.WireBytes = wire.Load()
+	return stats, composeAll(ctx, bkt, object, parts, runID)
 }
 
 // errSparseTooSmall says the object is not worth splitting, so the caller should fall
