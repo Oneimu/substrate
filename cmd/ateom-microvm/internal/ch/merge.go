@@ -42,47 +42,51 @@ import (
 // differential snapshot implemented on top of CH (which has no native diff
 // snapshot): it keeps OnDemand's fast, non-densifying restore while still producing
 // complete, re-restorable snapshots for the suspend/resume chain.
-func MergeSparseOverlay(ctx context.Context, baseFile, deltaFile, outFile string) error {
+//
+// Returns the populated bytes of deltaFile it overlaid — the size of the delta,
+// which is what a native differential snapshot would have uploaded.
+func MergeSparseOverlay(ctx context.Context, baseFile, deltaFile, outFile string) (int64, error) {
 	bi, err := os.Stat(baseFile)
 	if err != nil {
-		return fmt.Errorf("stat base %q: %w", baseFile, err)
+		return 0, fmt.Errorf("stat base %q: %w", baseFile, err)
 	}
 	// outFile := sparse copy of baseFile (preserves holes so it stays sparse).
 	tmp := outFile + ".merge.tmp"
 	_ = os.Remove(tmp)
 	if o, err := reaper.RunCombined(exec.CommandContext(ctx, "cp", "--sparse=always", baseFile, tmp)); err != nil {
-		return fmt.Errorf("cp base->tmp: %w: %s", err, o)
+		return 0, fmt.Errorf("cp base->tmp: %w: %s", err, o)
 	}
 
 	d, err := os.Open(deltaFile)
 	if err != nil {
-		return fmt.Errorf("open delta %q: %w", deltaFile, err)
+		return 0, fmt.Errorf("open delta %q: %w", deltaFile, err)
 	}
 	defer d.Close()
 	di, err := d.Stat()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if di.Size() != bi.Size() {
 		// Same guest => identical memory-ranges length. A mismatch means the overlay
 		// offsets wouldn't line up, so refuse rather than corrupt.
-		return fmt.Errorf("MergeSparseOverlay: size mismatch base=%d delta=%d", bi.Size(), di.Size())
+		return 0, fmt.Errorf("MergeSparseOverlay: size mismatch base=%d delta=%d", bi.Size(), di.Size())
 	}
 
 	o, err := os.OpenFile(tmp, os.O_RDWR, 0o600)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer o.Close()
 
-	if _, err := copySparseRegions(d, o); err != nil {
-		return err
+	deltaBytes, err := copySparseRegions(d, o)
+	if err != nil {
+		return 0, err
 	}
 	// No fsync: atelet ships the merged image to GCS (the durability point), so a
 	// partial local file after a node crash is just discarded + the suspend retried;
 	// paying an ~150MiB fsync on the suspend critical path buys nothing.
 	if err := o.Close(); err != nil {
-		return err
+		return 0, err
 	}
 	// Put the merged image at outFile's name. Unlink the old one FIRST, then rename
 	// onto the now-free name, for the same reason as MergeDeltaIntoBase's final
@@ -93,9 +97,9 @@ func MergeSparseOverlay(ctx context.Context, baseFile, deltaFile, outFile string
 	// ~1140ms→~115ms. Unlike there, outFile need not exist: this is also called to
 	// write a merged image to a fresh path.
 	if err := os.Remove(outFile); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove old out: %w", err)
+		return 0, fmt.Errorf("remove old out: %w", err)
 	}
-	return os.Rename(tmp, outFile)
+	return deltaBytes, os.Rename(tmp, outFile)
 }
 
 // MergeDeltaIntoBase overlays deltaFile's populated pages onto baseFile in place
@@ -113,19 +117,21 @@ func MergeSparseOverlay(ctx context.Context, baseFile, deltaFile, outFile string
 // checkpoint-state/), so the renames are same-filesystem (metadata-only). If they
 // straddle a mount boundary (EXDEV) it falls back to the copying MergeSparseOverlay
 // (baseFile is untouched until the first rename succeeds).
-func MergeDeltaIntoBase(ctx context.Context, baseFile, deltaFile string) error {
+//
+// Like MergeSparseOverlay, returns the populated bytes of the delta it overlaid.
+func MergeDeltaIntoBase(ctx context.Context, baseFile, deltaFile string) (int64, error) {
 	bi, err := os.Stat(baseFile)
 	if err != nil {
-		return fmt.Errorf("stat base %q: %w", baseFile, err)
+		return 0, fmt.Errorf("stat base %q: %w", baseFile, err)
 	}
 	di, err := os.Stat(deltaFile)
 	if err != nil {
-		return fmt.Errorf("stat delta %q: %w", deltaFile, err)
+		return 0, fmt.Errorf("stat delta %q: %w", deltaFile, err)
 	}
 	if di.Size() != bi.Size() {
 		// Same guest => identical memory-ranges length; a mismatch would misalign the
 		// overlay offsets, so refuse rather than corrupt.
-		return fmt.Errorf("MergeDeltaIntoBase: size mismatch base=%d delta=%d", bi.Size(), di.Size())
+		return 0, fmt.Errorf("MergeDeltaIntoBase: size mismatch base=%d delta=%d", bi.Size(), di.Size())
 	}
 
 	// Move baseFile (with its already-on-disk working set) next to deltaFile. If this
@@ -137,26 +143,27 @@ func MergeDeltaIntoBase(ctx context.Context, baseFile, deltaFile string) error {
 		if errors.Is(err, unix.EXDEV) {
 			return MergeSparseOverlay(ctx, baseFile, deltaFile, deltaFile)
 		}
-		return fmt.Errorf("rename base->merged: %w", err)
+		return 0, fmt.Errorf("rename base->merged: %w", err)
 	}
 
 	d, err := os.Open(deltaFile)
 	if err != nil {
-		return fmt.Errorf("open delta %q: %w", deltaFile, err)
+		return 0, fmt.Errorf("open delta %q: %w", deltaFile, err)
 	}
 	defer d.Close()
 	m, err := os.OpenFile(merged, os.O_RDWR, 0o600)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer m.Close()
-	if _, err := copySparseRegions(d, m); err != nil {
-		return err
+	deltaBytes, err := copySparseRegions(d, m)
+	if err != nil {
+		return 0, err
 	}
 	// No fsync: atelet ships the merged image to GCS (the durability point), so a
 	// partial local file after a crash is just discarded + the suspend retried.
 	if err := m.Close(); err != nil {
-		return err
+		return 0, err
 	}
 	// Put the merged image at deltaFile's name. Unlink the old delta FIRST, then
 	// rename onto the now-free name: renaming OVER an existing file makes ext4
@@ -165,9 +172,9 @@ func MergeDeltaIntoBase(ctx context.Context, baseFile, deltaFile string) error {
 	// ~0.5-0.8s. Renaming to a non-existent name skips that flush (the dirty pages
 	// stay in page cache for atelet to ship), taking the merge ~840ms→~5ms.
 	if err := os.Remove(deltaFile); err != nil {
-		return fmt.Errorf("remove old delta: %w", err)
+		return 0, fmt.Errorf("remove old delta: %w", err)
 	}
-	return os.Rename(merged, deltaFile)
+	return deltaBytes, os.Rename(merged, deltaFile)
 }
 
 // copySparseRegions overwrites dst with every populated (non-hole) region of src

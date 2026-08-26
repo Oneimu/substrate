@@ -29,6 +29,7 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
+	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/ateomstats"
 	"github.com/agent-substrate/substrate/internal/imagecache"
@@ -70,6 +71,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	s.setActiveRPC(rpcCheckpointWorkload, cancel)
 	defer s.clearActiveRPC()
 
+	tStart := time.Now()
 	if err := s.deactivateActorNetworking(ctx); err != nil {
 		return nil, err
 	}
@@ -145,12 +147,13 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	//   - Rootfs upper tar (Full only): host-backed like the durable volumes —
 	//     the memory snapshot does not carry rootfs writes. Under Data the
 	//     workload cold-starts on restore, discarding rootfs state.
-	var dSnapshot, dDurable, dUpper time.Duration
+	var snapStats vmSnapshotStats
+	var dDurable, dUpper time.Duration
 	g, gctx := errgroup.WithContext(ctx)
 	if scope == ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL {
 		g.Go(func() error {
 			var err error
-			dSnapshot, err = s.snapshotVMState(gctx, client, ra, actorUID, checkpointDir)
+			snapStats, err = s.snapshotVMState(gctx, client, ra, actorUID, checkpointDir)
 			return err
 		})
 	}
@@ -200,19 +203,48 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor checkpointed", attribution)
 	slog.InfoContext(ctx, "Actor checkpointed", slog.String("id", actorUID), slog.Any("snapshot_files", snapshotFiles),
 		slog.String("scope", scope.String()), slog.Duration("pause", dPause),
-		slog.Duration("snapshot", dSnapshot),
+		slog.Duration("snapshot", snapStats.snapshot),
 		// The tars run while the guest is paused, CONCURRENTLY with the CH
 		// snapshot: the paused window costs max(snapshot, durable_dir,
 		// rootfs_upper), and the tar durations scale with the actor's data.
 		slog.Duration("durable_dir", dDurable), slog.Duration("rootfs_upper", dUpper),
 		slog.Duration("teardown", dTeardown))
+
+	op := snapshotOp{
+		templateNamespace: attribution.TemplateNamespace,
+		templateName:      attribution.TemplateName,
+		scope:             scope,
+	}
+	s.instruments.recordCheckpoint(ctx, op,
+		phase{ateattr.SnapshotPhasePause, dPause},
+		phase{ateattr.SnapshotPhaseSnapshot, snapStats.snapshot},
+		phase{ateattr.SnapshotPhaseDurableDir, dDurable},
+		phase{ateattr.SnapshotPhaseRootfsUpper, dUpper},
+		phase{ateattr.SnapshotPhaseMerge, snapStats.merge},
+		phase{ateattr.SnapshotPhaseTeardown, dTeardown},
+		phase{ateattr.SnapshotPhaseTotal, time.Since(tStart)})
+	if snapStats.merged {
+		s.instruments.recordDeltaSize(ctx, op, snapStats.deltaBytes)
+	}
 	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
+}
+
+// vmSnapshotStats reports what snapshotVMState did: how long the CH snapshot
+// took, and — for an OnDemand-restored actor — how long the delta merge took
+// and how many populated delta bytes it overlaid onto the restore source.
+type vmSnapshotStats struct {
+	snapshot time.Duration
+	merge    time.Duration
+	// deltaBytes is meaningful only when merged is true: a cold-run or
+	// eager-restored actor merges nothing.
+	deltaBytes int64
+	merged     bool
 }
 
 // snapshotVMState captures the paused guest into checkpointDir: the CH snapshot
 // (config.json + state.json + memory-ranges) plus the base-id the restore side
-// needs, and returns how long the snapshot itself took.
-func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, ra *runningActor, actorUID, checkpointDir string) (time.Duration, error) {
+// needs, and returns how long the snapshot (and any delta merge) took.
+func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, ra *runningActor, actorUID, checkpointDir string) (vmSnapshotStats, error) {
 	// Record the FROZEN base id (the id the guest's virtio-fs find-paths are pinned
 	// to, <baseID>/rootfs). For a cold-run actor this is its own id; for a restored
 	// actor it is the golden id propagated via ra.baseID (set from the snapshot we
@@ -224,16 +256,17 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 	if ra != nil && ra.baseID != "" {
 		baseID = ra.baseID
 	}
+	var stats vmSnapshotStats
 	if err := os.WriteFile(filepath.Join(checkpointDir, baseIDFile), []byte(baseID), 0o600); err != nil {
-		return 0, fmt.Errorf("while writing %s: %w", baseIDFile, err)
+		return stats, fmt.Errorf("while writing %s: %w", baseIDFile, err)
 	}
 
 	slog.InfoContext(ctx, "Snapshotting guest", slog.String("id", actorUID), slog.String("dir", checkpointDir))
 	tSnapshot := time.Now()
 	if err := client.Snapshot(ctx, checkpointDir); err != nil {
-		return 0, fmt.Errorf("while snapshotting guest: %w", err)
+		return stats, fmt.Errorf("while snapshotting guest: %w", err)
 	}
-	dSnapshot := time.Since(tSnapshot)
+	stats.snapshot = time.Since(tSnapshot)
 
 	// Diff-snapshot completion for an OnDemand-restored actor: CH's snapshot here is
 	// sparse — only the pages faulted in since the OnDemand restore — so on its own
@@ -254,16 +287,21 @@ func (s *AteomService) snapshotVMState(ctx context.Context, client *ch.Client, r
 		// Reuse base's on-disk working set (rename + overlay) instead of copying it —
 		// CH is paused and about to be torn down, and base is discarded after. See
 		// MergeDeltaIntoBase. (Falls back to the copying merge across filesystems.)
-		if err := ch.MergeDeltaIntoBase(ctx, base, delta); err != nil {
-			return 0, fmt.Errorf("while merging OnDemand delta into restore source: %w", err)
+		deltaBytes, err := ch.MergeDeltaIntoBase(ctx, base, delta)
+		if err != nil {
+			return stats, fmt.Errorf("while merging OnDemand delta into restore source: %w", err)
 		}
+		stats.merge = time.Since(tMerge)
+		stats.deltaBytes = deltaBytes
+		stats.merged = true
 		slog.InfoContext(ctx, "Merged OnDemand delta into base (complete snapshot)",
-			slog.String("id", actorUID), slog.Duration("merge", time.Since(tMerge)))
+			slog.String("id", actorUID), slog.Duration("merge", stats.merge),
+			slog.Int64("delta_bytes", deltaBytes))
 	}
 
 	// The RO lower never ships (reconstructed from the OCI image at restore).
 	// The disk-backed upper ships as its own tar from CheckpointWorkload; a
-	return dSnapshot, nil
+	return stats, nil
 }
 
 // listFiles returns the (relative) names of regular files directly under dir.

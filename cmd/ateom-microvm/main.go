@@ -151,6 +151,11 @@ func do(ctx context.Context) error {
 	}
 	defer serverboot.ShutdownProvider("MeterProvider", mp.Shutdown)
 
+	instruments, err := NewInstruments(mp.Meter(serviceName))
+	if err != nil {
+		serverboot.Fatal(ctx, "Failed to create metric instruments", err)
+	}
+
 	// Create ateom dir.
 	ateomDir := ateompath.AteomPath(*podUID)
 	if err := os.MkdirAll(ateomDir, 0o700); err != nil {
@@ -253,7 +258,7 @@ func do(ctx context.Context) error {
 	}()
 	slog.InfoContext(ctx, "atunnel egress serving", slog.String("address", *atunnelEgressListenAddress))
 
-	ateomService := NewService(*podUID, *chBinary, *kataConfig, *kataDebug, *vmmMemReserve, interiorNetNS, actorLogger, atunnelIngress, atunnelEgress, atunnelEgressPort, *workerCredentialBundle, *podIdentityTrustBundle, *egressGatewayTrustBundle)
+	ateomService := NewService(*podUID, *chBinary, *kataConfig, *kataDebug, *vmmMemReserve, interiorNetNS, actorLogger, atunnelIngress, atunnelEgress, atunnelEgressPort, *workerCredentialBundle, *podIdentityTrustBundle, *egressGatewayTrustBundle, instruments)
 
 	svr := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
@@ -448,6 +453,11 @@ type AteomService struct {
 	// one happen — GetWorkloadStats must not take lock at all.
 	activeActor atomic.Pointer[resources.ActorAttribution]
 
+	// instruments holds the snapshot phase histograms. Nil is a valid no-op
+	// (see Instruments), so tests that build an AteomService by hand need no
+	// meter.
+	instruments *Instruments
+
 	// guestStats is what GetWorkloadStats measures with: the kata-agent client
 	// and the guest containers to sum. Nil whenever there is no guest to ask —
 	// before the containers are up, after teardownActor, and for the rest of an
@@ -469,7 +479,7 @@ type AteomService struct {
 var _ ateompb.AteomServer = (*AteomService)(nil)
 
 // NewService creates a new AteomService.
-func NewService(podUID, chBinary, kataConfig string, kataDebug bool, memReserveMiB int, interiorNetNS netns.NsHandle, actorLogger *actorlog.ActorLogger, atunnelIngress *atunnel.Server, atunnelEgress *atunnel.Egress, atunnelEgressPort uint16, workerCredentialBundlePath, podIdentityTrustBundlePath, egressGatewayTrustBundlePath string) *AteomService {
+func NewService(podUID, chBinary, kataConfig string, kataDebug bool, memReserveMiB int, interiorNetNS netns.NsHandle, actorLogger *actorlog.ActorLogger, atunnelIngress *atunnel.Server, atunnelEgress *atunnel.Egress, atunnelEgressPort uint16, workerCredentialBundlePath, podIdentityTrustBundlePath, egressGatewayTrustBundlePath string, instruments *Instruments) *AteomService {
 	return &AteomService{
 		lock:                         newCancelableMutex(),
 		podUID:                       podUID,
@@ -485,6 +495,7 @@ func NewService(podUID, chBinary, kataConfig string, kataDebug bool, memReserveM
 		workerCredentialBundlePath:   workerCredentialBundlePath,
 		podIdentityTrustBundlePath:   podIdentityTrustBundlePath,
 		egressGatewayTrustBundlePath: egressGatewayTrustBundlePath,
+		instruments:                  instruments,
 		running:                      map[string]*runningActor{},
 	}
 }

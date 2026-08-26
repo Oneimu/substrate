@@ -196,11 +196,14 @@ groups:
       - id: ate.snapshot.phase
         stability: development
         brief: >
-          The step of the operation that the component measured. The phases
-          occur at the same time. Thus they do not add up to the total. The
-          download occurs at the same time as the asset fetch and the OCI
-          unpack. Each phase is an independent measurement. A phase that did not
-          start is absent. It is not zero.
+          The step of the operation that the component measured. On the atelet
+          instruments the phases occur at the same time. Thus they do not add
+          up to the total. The download occurs at the same time as the asset
+          fetch and the OCI unpack. Each phase is an independent measurement.
+          A phase that did not start is absent. It is not zero. The
+          ateom-microvm instruments use their own values below. On those the
+          restore phases are sequential and do add up to the total; the note
+          of each instrument says which rule applies.
         type:
           members:
             - id: volume_mount
@@ -242,6 +245,82 @@ groups:
               stability: development
               value: total
               brief: The full operation. Use this value as the denominator. Do not add the phases together.
+            - id: pause
+              stability: development
+              value: pause
+              brief: Checkpoint on ateom-microvm. ateom pauses the guest.
+            - id: snapshot
+              stability: development
+              value: snapshot
+              brief: >
+                Checkpoint on ateom-microvm. cloud-hypervisor writes the VM
+                state and the memory image. This runs at the same time as
+                durable_dir and rootfs_upper.
+            - id: durable_dir
+              stability: development
+              value: durable_dir
+              brief: >
+                Checkpoint on ateom-microvm. ateom tars the durable-dir
+                volumes. This runs at the same time as snapshot and
+                rootfs_upper.
+            - id: rootfs_upper
+              stability: development
+              value: rootfs_upper
+              brief: >
+                Checkpoint on ateom-microvm. ateom tars the rootfs upper. This
+                runs at the same time as snapshot and durable_dir.
+            - id: merge
+              stability: development
+              value: merge
+              brief: >
+                Checkpoint on ateom-microvm. ateom overlays the OnDemand delta
+                onto the restore source. This occurs only for an actor that
+                was restored OnDemand.
+            - id: teardown
+              stability: development
+              value: teardown
+              brief: Checkpoint on ateom-microvm. ateom stops the VMM and cleans the sandbox up.
+            - id: prep
+              stability: development
+              value: prep
+              brief: >
+                Restore on ateom-microvm. The steps before the bundle build,
+                with the durable-dir untar and the snapshot path rewrite.
+            - id: bundles
+              stability: development
+              value: bundles
+              brief: Restore on ateom-microvm. ateom builds the container bundles.
+            - id: upper_join
+              stability: development
+              value: upper_join
+              brief: >
+                Restore on ateom-microvm. ateom waits for the rootfs upper
+                untar. The untar runs behind the bundle build, so this is only
+                the part that did not hide.
+            - id: lowers
+              stability: development
+              value: lowers
+              brief: Restore on ateom-microvm. ateom assembles the merged rootfs and starts virtiofsd.
+            - id: tap
+              stability: development
+              value: tap
+              brief: Restore on ateom-microvm. ateom rebuilds the actor network and the tap devices.
+            - id: vmm_launch
+              stability: development
+              value: vmm_launch
+              brief: Restore on ateom-microvm. ateom launches cloud-hypervisor.
+            - id: vm_restore
+              stability: development
+              value: vm_restore
+              brief: Restore on ateom-microvm. cloud-hypervisor reads the guest state back.
+            - id: resume
+              stability: development
+              value: resume
+              brief: Restore on ateom-microvm. cloud-hypervisor resumes the guest.
+            - id: readyz
+              stability: development
+              value: readyz
+              brief: Restore on ateom-microvm. ateom waits until each container reports ready.
 
   - id: registry.ate.failure
     type: attribute_group
@@ -974,6 +1053,97 @@ groups:
             The outcome is error. The key holds the HTTP status of the registry.
             The permitted values are 401, 403, 404, 429, 500, 502, 503 and 504.
             Each other status, and each failure with no status, reports _OTHER.
+
+  # ---------------------------------------------------------------------------
+  # Metrics. ateom-microvm
+  # ---------------------------------------------------------------------------
+
+  - id: metric.ateom.actor.restore.duration
+    type: metric
+    metric_name: ateom.actor.restore.duration
+    instrument: histogram
+    unit: s
+    stability: development
+    brief: The time of one phase of an actor restore inside ateom-microvm.
+    note: >
+      This instrument breaks the ateom_restore phase of
+      ate.actor.restore.duration down. The phases are sequential. They
+      partition the total, so here they do add up to the total. A Data scope
+      restore is a cold boot, and it records only the total. ateom records the
+      phases on success only. The failures are on the atelet histogram.
+    annotations:
+      substrate:
+        emitted_by: [ateom-microvm]
+        golden_signals: [latency]
+        code_anchor: cmd/ateom-microvm/metrics.go
+        buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60]
+        cuj: The ateom restore is slow. Is the cause the rootfs assembly, the VMM, or the readyz wait?
+    attributes:
+      - ref: ate.template.namespace
+        requirement_level: required
+      - ref: ate.template.name
+        requirement_level: required
+      - ref: ate.snapshot.scope
+        requirement_level: required
+      - ref: ate.snapshot.phase
+        requirement_level: required
+
+  - id: metric.ateom.actor.checkpoint.duration
+    type: metric
+    metric_name: ateom.actor.checkpoint.duration
+    instrument: histogram
+    unit: s
+    stability: development
+    brief: The time of one phase of an actor checkpoint inside ateom-microvm.
+    note: >
+      This instrument breaks the ateom_checkpoint phase of
+      ate.actor.checkpoint.duration down. The snapshot, durable_dir and
+      rootfs_upper captures run at the same time on the paused guest. Thus
+      those three do not add up to the total. The paused window costs the
+      slowest of them. ateom records the phases on success only.
+    annotations:
+      substrate:
+        emitted_by: [ateom-microvm]
+        golden_signals: [latency]
+        code_anchor: cmd/ateom-microvm/metrics.go
+        buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60]
+        cuj: The ateom checkpoint is slow. Is the cause the memory snapshot, a tar, or the merge?
+    attributes:
+      - ref: ate.template.namespace
+        requirement_level: required
+      - ref: ate.template.name
+        requirement_level: required
+      - ref: ate.snapshot.scope
+        requirement_level: required
+      - ref: ate.snapshot.phase
+        requirement_level: required
+
+  - id: metric.ateom.snapshot.delta.size
+    type: metric
+    metric_name: ateom.snapshot.delta.size
+    instrument: histogram
+    unit: By
+    stability: development
+    brief: The populated bytes of the OnDemand delta that a checkpoint merged into its restore source.
+    note: >
+      After an OnDemand restore, cloud-hypervisor writes only the pages that
+      the guest faulted in. ateom merges that delta into the restore source to
+      make the snapshot complete, and this instrument records the size of the
+      delta before the merge. Compare it with atelet.snapshot.size of the
+      memory image: the ratio says how much a delta upload would save. An
+      eager restore and a cold run merge nothing and record nothing.
+    annotations:
+      substrate:
+        emitted_by: [ateom-microvm]
+        golden_signals: [saturation]
+        code_anchor: cmd/ateom-microvm/metrics.go
+        buckets: [100000, 1000000, 5000000, 10000000, 25000000, 50000000, 100000000, 250000000, 500000000, 1000000000, 2000000000, 5000000000]
+        cuj: Would a differential snapshot upload be a small win or a large one?
+    attributes:
+      - ref: ate.template.namespace
+        requirement_level: required
+      - ref: ate.template.name
+        requirement_level: required
 
   # ---------------------------------------------------------------------------
   # Metrics. atecontroller

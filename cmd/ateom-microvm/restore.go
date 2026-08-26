@@ -30,6 +30,7 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
+	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/imagecache"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
@@ -142,7 +143,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		// files, and the untar above re-materialized the ACTOR's durable-dir
 		// data, so resuming the golden guest picks up the actor's data through
 		// the durable virtio-fs share.
-		if err := s.restoreFullScope(ctx, p, restoreDir, tStart); err != nil {
+		if err := s.restoreFullScope(ctx, p, scope, restoreDir, tStart); err != nil {
 			return nil, err
 		}
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
@@ -152,8 +153,14 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		if err := s.coldBootActorRetrying(ctx, p); err != nil {
 			return nil, err
 		}
+		dTotal := time.Since(tStart)
 		slog.InfoContext(ctx, "Actor restored (durable-dir volumes, cold boot)",
-			slog.String("id", p.actorUID), slog.Duration("total", time.Since(tStart)))
+			slog.String("id", p.actorUID), slog.Duration("total", dTotal))
+		// A cold boot has none of the full-scope phases, so the total is the
+		// only observation.
+		s.instruments.recordRestore(ctx,
+			snapshotOp{templateNamespace: p.templateNS, templateName: p.templateName, scope: scope},
+			phase{ateattr.SnapshotPhaseTotal, dTotal})
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unsupported snapshot scope: %v", scope)
 	}
@@ -174,7 +181,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 // and resume. Guest RAM — the actor's in-memory state and the frozen network config —
 // comes back from the memory snapshot; the durable-dir volumes were restored by the
 // caller from their tar.
-func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, restoreDir string, tStart time.Time) (retErr error) {
+func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, scope ateompb.SnapshotScope, restoreDir string, tStart time.Time) (retErr error) {
 	actorUID := p.actorUID
 
 	rr := s.resolveRuntime(p.assetPaths)
@@ -362,6 +369,8 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	// which hid that a first (cold) restore and a later (warm) one differ by more
 	// than 5x on the same actor. upper/lowers is the host reassembling the rootfs;
 	// vm_restore is cloud-hypervisor reading guest RAM back.
+	dReadyz := time.Since(tResume)
+	dTotal := time.Since(tStart)
 	slog.InfoContext(ctx, "Actor restore phases", slog.String("id", actorUID),
 		slog.Duration("prep", tPrep.Sub(tStart)),
 		slog.Duration("bundles", tBundles.Sub(tPrep)),
@@ -372,8 +381,22 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 		slog.Duration("vmm_launch", tLaunch.Sub(tTap)),
 		slog.Duration("vm_restore", tVMRestore.Sub(tLaunch)),
 		slog.Duration("resume", tResume.Sub(tVMRestore)),
-		slog.Duration("readyz", time.Since(tResume)),
-		slog.Duration("total", time.Since(tStart)))
+		slog.Duration("readyz", dReadyz),
+		slog.Duration("total", dTotal))
+	// The durable delta is not recorded: tDurable is pinned to tLowers today,
+	// so it would always be the zero recordPhases skips.
+	s.instruments.recordRestore(ctx,
+		snapshotOp{templateNamespace: p.templateNS, templateName: p.templateName, scope: scope},
+		phase{ateattr.SnapshotPhasePrep, tPrep.Sub(tStart)},
+		phase{ateattr.SnapshotPhaseBundles, tBundles.Sub(tPrep)},
+		phase{ateattr.SnapshotPhaseUpperJoin, tUpper.Sub(tBundles)},
+		phase{ateattr.SnapshotPhaseLowers, tLowers.Sub(tUpper)},
+		phase{ateattr.SnapshotPhaseTap, tTap.Sub(tDurable)},
+		phase{ateattr.SnapshotPhaseVMMLaunch, tLaunch.Sub(tTap)},
+		phase{ateattr.SnapshotPhaseVMRestore, tVMRestore.Sub(tLaunch)},
+		phase{ateattr.SnapshotPhaseResume, tResume.Sub(tVMRestore)},
+		phase{ateattr.SnapshotPhaseReadyz, dReadyz},
+		phase{ateattr.SnapshotPhaseTotal, dTotal})
 
 	// An eager restore has read the whole snapshot into guest memory, and nothing
 	// merges against it afterwards, so the staged copy is dead weight from here on —

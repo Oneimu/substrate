@@ -262,6 +262,32 @@ const (
 	SnapshotPhaseTotal   = "total"
 )
 
+// Values for SnapshotPhaseKey emitted by ateom-microvm: the breakdown inside
+// the ateom_restore / ateom_checkpoint phases above, promoted from its
+// structured phase logs. Unlike the atelet phases, the restore phases here
+// are sequential and partition the total; the checkpoint captures (snapshot,
+// durable_dir, rootfs_upper) run concurrently on the paused guest, so those
+// three are independent observations.
+const (
+	// Checkpoint phases.
+	SnapshotPhasePause       = "pause"
+	SnapshotPhaseSnapshot    = "snapshot"
+	SnapshotPhaseDurableDir  = "durable_dir"
+	SnapshotPhaseRootfsUpper = "rootfs_upper"
+	SnapshotPhaseMerge       = "merge"
+	SnapshotPhaseTeardown    = "teardown"
+	// Restore phases.
+	SnapshotPhasePrep      = "prep"
+	SnapshotPhaseBundles   = "bundles"
+	SnapshotPhaseUpperJoin = "upper_join"
+	SnapshotPhaseLowers    = "lowers"
+	SnapshotPhaseTap       = "tap"
+	SnapshotPhaseVMMLaunch = "vmm_launch"
+	SnapshotPhaseVMRestore = "vm_restore"
+	SnapshotPhaseResume    = "resume"
+	SnapshotPhaseReadyz    = "readyz"
+)
+
 // FailureReason classifies err onto the bounded ateerrors taxonomy, reading the
 // wrapped Reason or the AIP-193 ErrorInfo detail. An error carrying neither
 // reports ReasonUnknown rather than anything derived from its message, which is
