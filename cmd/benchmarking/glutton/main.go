@@ -385,14 +385,14 @@ func (s *gluttonService) WriteRAM(ctx context.Context, req *glutton.WriteRAMRequ
 	if req.GetKey() == "" {
 		return nil, status.Error(codes.InvalidArgument, "key is required")
 	}
-	size64, err := parseBytes(req.GetSize())
+	sizeBytes, err := parseBytes(req.GetSize())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "size: %v", err)
 	}
-	if size64 < 0 {
+	if sizeBytes < 0 {
 		return nil, status.Error(codes.InvalidArgument, "size must be non-negative")
 	}
-	size := int(size64)
+	size := int(sizeBytes)
 
 	switch req.GetWriteMode() {
 	case glutton.WriteMode_WRITE_MODE_TRUNCATE:
