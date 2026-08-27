@@ -69,14 +69,10 @@ message WriteRAMRequest {
   // name of the array to be written to
   string key = 1;
 
-  // size of bytes to be written
-  int32 size = 2;
+  // size of bytes to be written, with an optional unit suffix (e.g. "2Gi")
+  string size = 2;
 
   WriteMode write_mode = 3;
-
-  // size of bytes to be written, with an optional unit suffix (e.g. "2Gi");
-  // takes precedence over size
-  string size_str = 4;
 }
 
 message WriteRAMResponse {

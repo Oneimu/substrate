@@ -92,7 +92,7 @@ tests:
       - "--max-wait-time"
       - "1.0"
   # Large-memory variants: same load shape as the 1-user baseline, but the
-  # GluttonUser fills the actor's RAM to --mem-target-bytes through the
+  # GluttonUser fills the actor's RAM to --mem-target through the
   # glutton WriteRAM API before the first suspend, so every suspend/resume
   # cycle is measured against a realistically-sized actor. actorMemory =
   # target + headroom (glutton itself, the guest, and on microvm the 128Mi
@@ -108,8 +108,8 @@ tests:
     workerCount: 1
     actorMemory: "1536Mi"
     flags:
-      - "--mem-target-bytes"
-      - "1073741824"
+      - "--mem-target"
+      - "1Gi"
       - "--min-wait-time"
       - "1.0"
       - "--max-wait-time"
@@ -125,8 +125,8 @@ tests:
     sandboxClass: microvm
     actorMemory: "1536Mi"
     flags:
-      - "--mem-target-bytes"
-      - "1073741824"
+      - "--mem-target"
+      - "1Gi"
       - "--min-wait-time"
       - "1.0"
       - "--max-wait-time"
@@ -141,8 +141,8 @@ tests:
     workerCount: 1
     actorMemory: "2560Mi"
     flags:
-      - "--mem-target-bytes"
-      - "2147483648"
+      - "--mem-target"
+      - "2Gi"
       - "--min-wait-time"
       - "1.0"
       - "--max-wait-time"
@@ -158,8 +158,8 @@ tests:
     sandboxClass: microvm
     actorMemory: "2560Mi"
     flags:
-      - "--mem-target-bytes"
-      - "2147483648"
+      - "--mem-target"
+      - "2Gi"
       - "--min-wait-time"
       - "1.0"
       - "--max-wait-time"

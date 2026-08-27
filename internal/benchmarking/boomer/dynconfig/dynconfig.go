@@ -54,7 +54,7 @@ type Config struct {
 	ResumeMode       string // ResumeModeExplicit | ResumeModeImplicit
 	DurDirReadMode   string // ReadModeData | ReadModeDigest
 	DurDirTemplate   string // ActorTemplate name
-	MemTargetBytes   int64  // resident RAM the GluttonUser fills via WriteRAM; 0 disables
+	MemTarget        string // resident RAM the GluttonUser fills via WriteRAM, suffixed (e.g. "2Gi"); "" disables
 }
 
 // Holder lets readers Load() the current Config and writers Store() a new
@@ -92,7 +92,7 @@ type payload struct {
 	ResumeMode       *string  `json:"resume_mode"`
 	DurDirReadMode   *string  `json:"durdir_read_mode"`
 	DurDirTemplate   *string  `json:"durdir_template"`
-	MemTargetBytes   *float64 `json:"mem_target_bytes"`
+	MemTarget        *string  `json:"mem_target"`
 }
 
 // Parse decodes a JSON blob (typically from a CLI flag) and merges its
@@ -165,9 +165,8 @@ func (c Config) Validate() error {
 	if c.DurDirReadMode != "" && c.DurDirReadMode != ReadModeData && c.DurDirReadMode != ReadModeDigest {
 		return fmt.Errorf("invalid durdir_read_mode %q: must be %q or %q", c.DurDirReadMode, ReadModeData, ReadModeDigest)
 	}
-	if c.MemTargetBytes < 0 {
-		return fmt.Errorf("mem_target_bytes cannot be negative: %d", c.MemTargetBytes)
-	}
+	// MemTarget is passed to glutton verbatim, which owns the parse; an
+	// invalid value fails loudly there as a GluttonFillRAM error.
 	return nil
 }
 
@@ -197,8 +196,8 @@ func (p payload) merge(current Config) Config {
 	if p.DurDirTemplate != nil {
 		out.DurDirTemplate = *p.DurDirTemplate
 	}
-	if p.MemTargetBytes != nil {
-		out.MemTargetBytes = int64(*p.MemTargetBytes)
+	if p.MemTarget != nil {
+		out.MemTarget = *p.MemTarget
 	}
 	return out
 }
@@ -265,7 +264,7 @@ func StartPoll(
 					slog.String("resume_mode", next.ResumeMode),
 					slog.String("durdir_read_mode", next.DurDirReadMode),
 					slog.String("durdir_template", next.DurDirTemplate),
-					slog.Int64("mem_target_bytes", next.MemTargetBytes),
+					slog.String("mem_target", next.MemTarget),
 				)
 			}
 		}
@@ -299,7 +298,7 @@ func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetc
 			slog.String("resume_mode", next.ResumeMode),
 			slog.String("durdir_read_mode", next.DurDirReadMode),
 			slog.String("durdir_template", next.DurDirTemplate),
-			slog.Int64("mem_target_bytes", next.MemTargetBytes),
+			slog.String("mem_target", next.MemTarget),
 		)
 	})
 }

@@ -22,11 +22,12 @@ from locust.argument_parser import LocustArgumentParser
 def add_memload_arguments(parser: LocustArgumentParser) -> None:
     group = parser.add_argument_group("Memory Benchmark")
     group.add_argument(
-        "--mem-target-bytes",
-        type=int,
-        default=0,
+        "--mem-target",
+        type=str,
+        default="",
         help="Resident working set each GluttonUser gives its actor via the "
-        "glutton WriteRAM API before the first suspend, so suspend/resume "
-        "cycles run against realistically-sized memory (default: 0 = "
-        "disabled). Size the actorMemory limit above it for headroom.",
+        "glutton WriteRAM API before the first suspend, with an optional "
+        "unit suffix (e.g. '1Gi'), so suspend/resume cycles run against "
+        "realistically-sized memory (default: empty = disabled). Size the "
+        "actorMemory limit above it for headroom.",
     )

@@ -385,12 +385,9 @@ func (s *gluttonService) WriteRAM(ctx context.Context, req *glutton.WriteRAMRequ
 	if req.GetKey() == "" {
 		return nil, status.Error(codes.InvalidArgument, "key is required")
 	}
-	size64 := int64(req.GetSize())
-	if s := req.GetSizeStr(); s != "" {
-		var err error
-		if size64, err = parseBytes(s); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "size_str: %v", err)
-		}
+	size64, err := parseBytes(req.GetSize())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "size: %v", err)
 	}
 	if size64 < 0 {
 		return nil, status.Error(codes.InvalidArgument, "size must be non-negative")

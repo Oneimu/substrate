@@ -19,7 +19,7 @@ Flag registration lives in the modules that own each flag:
   * --min-wait-time / --max-wait-time → common.wait_time.init_wait_time
   * --resume-mode                   → common.resume_mode.add_resume_mode_arguments
   * --durdir-*                      → common.durdir_config.add_durdir_arguments
-  * --mem-target-bytes              → common.memload_config.add_memload_arguments
+  * --mem-target                    → common.memload_config.add_memload_arguments
 
 This module ties them together so boomer-Go workers can pick up the values
 the operator set in the web UI form:
@@ -53,7 +53,7 @@ _FLAGS = {
     "--resume-mode": str,
     "--durdir-read-mode": str,
     "--durdir-template": str,
-    "--mem-target-bytes": int,
+    "--mem-target": str,
 }
 
 

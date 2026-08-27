@@ -334,7 +334,7 @@ func (u *gluttonUser) ping(ctx context.Context) {
 }
 
 // ensureRAMFilled grows the actor's resident working set to the configured
-// mem_target_bytes through the glutton WriteRAM API. Runs once per actor:
+// mem_target through the glutton WriteRAM API. Runs once per actor:
 // glutton holds the allocation for its lifetime, so it persists across
 // suspend/resume and every snapshot from the first suspend onward is at
 // size. A failure leaves ramFilled unset so the next iteration retries.
@@ -344,8 +344,8 @@ func (u *gluttonUser) ensureRAMFilled(ctx context.Context) {
 	if u.ramFilled {
 		return
 	}
-	target := u.cfg.Dyn.Load().MemTargetBytes
-	if target <= 0 {
+	target := u.cfg.Dyn.Load().MemTarget
+	if target == "" {
 		u.ramFilled = true
 		return
 	}
@@ -354,7 +354,7 @@ func (u *gluttonUser) ensureRAMFilled(ctx context.Context) {
 	defer span.End()
 	start := time.Now()
 
-	err := u.writeRAM(ctx, "memload", strconv.FormatInt(target, 10))
+	err := u.writeRAM(ctx, "memload", target)
 	clientLatency := time.Since(start)
 	logSampledTrace(span, "GluttonFillRAM", clientLatency, sourceClient, err)
 	if err != nil {
@@ -362,17 +362,16 @@ func (u *gluttonUser) ensureRAMFilled(ctx context.Context) {
 		return
 	}
 	u.ramFilled = true
-	bmetrics.RecordSuccess("http", "GluttonFillRAM", userClass, clientLatency, target)
+	bmetrics.RecordSuccess("http", "GluttonFillRAM", userClass, clientLatency, 0)
 }
 
 // writeRAM POSTs one WriteRAM allocation to the actor through the router,
-// mirroring ping's wire format (protobuf over HTTP). sizeStr carries the
-// byte count as a string (the WriteRAMRequest.size int32 cannot express
-// >2GiB targets).
-func (u *gluttonUser) writeRAM(ctx context.Context, key, sizeStr string) error {
+// mirroring ping's wire format (protobuf over HTTP). size is a suffixed
+// string (e.g. "2Gi") passed through verbatim; glutton parses it.
+func (u *gluttonUser) writeRAM(ctx context.Context, key, size string) error {
 	body, err := proto.Marshal(&gluttonpb.WriteRAMRequest{
 		Key:       key,
-		SizeStr:   sizeStr,
+		Size:      size,
 		WriteMode: gluttonpb.WriteMode_WRITE_MODE_TRUNCATE,
 	})
 	if err != nil {
@@ -396,7 +395,7 @@ func (u *gluttonUser) writeRAM(ctx context.Context, key, sizeStr string) error {
 		return err
 	}
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("WriteRAM %s (%s bytes): HTTP %d: %s", key, sizeStr, resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return fmt.Errorf("WriteRAM %s (%s): HTTP %d: %s", key, size, resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 	return nil
 }
