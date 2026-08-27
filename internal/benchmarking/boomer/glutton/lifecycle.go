@@ -56,10 +56,6 @@ const (
 	pingPath     = "/ping"
 	writeRAMPath = "/writeram"
 
-	// ramChunkBytes bounds one WriteRAM call: the proto size field is int32,
-	// so a >2GiB target must arrive as several keyed allocations.
-	ramChunkBytes = 64 << 20
-
 	sourceClient = "client"
 	sourceServer = "server"
 )
@@ -338,13 +334,12 @@ func (u *gluttonUser) ping(ctx context.Context) {
 }
 
 // ensureRAMFilled grows the actor's resident working set to the configured
-// mem_target_bytes through the glutton WriteRAM API, one keyed chunk per
-// call (the proto size field is int32). Runs once per actor: glutton holds
-// the allocations for its lifetime, so they persist across suspend/resume
-// and every snapshot from the first suspend onward is at size. A failed
-// chunk aborts the fill; the next iteration retries from the top (TRUNCATE
-// writes make re-sent chunks idempotent in size). The whole fill reports as
-// one GluttonFillRAM stats row so it never pollutes ping or resume numbers.
+// mem_target_bytes through the glutton WriteRAM API. Runs once per actor:
+// glutton holds the allocation for its lifetime, so it persists across
+// suspend/resume and every snapshot from the first suspend onward is at
+// size. A failure leaves ramFilled unset so the next iteration retries.
+// The fill reports as its own GluttonFillRAM stats row so it never
+// pollutes ping or resume numbers.
 func (u *gluttonUser) ensureRAMFilled(ctx context.Context) {
 	if u.ramFilled {
 		return
@@ -359,33 +354,25 @@ func (u *gluttonUser) ensureRAMFilled(ctx context.Context) {
 	defer span.End()
 	start := time.Now()
 
-	var chunk int
-	for remaining := target; remaining > 0; chunk++ {
-		size := int64(ramChunkBytes)
-		if remaining < size {
-			size = remaining
-		}
-		if err := u.writeRAMChunk(ctx, fmt.Sprintf("memload-%d", chunk), int32(size)); err != nil {
-			clientLatency := time.Since(start)
-			logSampledTrace(span, "GluttonFillRAM", clientLatency, sourceClient, err)
-			bmetrics.RecordFailure("http", "GluttonFillRAM", userClass, clientLatency, err.Error())
-			return
-		}
-		remaining -= size
-	}
-
-	u.ramFilled = true
+	err := u.writeRAM(ctx, "memload", strconv.FormatInt(target, 10))
 	clientLatency := time.Since(start)
-	logSampledTrace(span, "GluttonFillRAM", clientLatency, sourceClient, nil)
+	logSampledTrace(span, "GluttonFillRAM", clientLatency, sourceClient, err)
+	if err != nil {
+		bmetrics.RecordFailure("http", "GluttonFillRAM", userClass, clientLatency, err.Error())
+		return
+	}
+	u.ramFilled = true
 	bmetrics.RecordSuccess("http", "GluttonFillRAM", userClass, clientLatency, target)
 }
 
-// writeRAMChunk POSTs one WriteRAM allocation to the actor through the
-// router, mirroring ping's wire format (protobuf over HTTP).
-func (u *gluttonUser) writeRAMChunk(ctx context.Context, key string, size int32) error {
+// writeRAM POSTs one WriteRAM allocation to the actor through the router,
+// mirroring ping's wire format (protobuf over HTTP). sizeStr carries the
+// byte count as a string (the WriteRAMRequest.size int32 cannot express
+// >2GiB targets).
+func (u *gluttonUser) writeRAM(ctx context.Context, key, sizeStr string) error {
 	body, err := proto.Marshal(&gluttonpb.WriteRAMRequest{
 		Key:       key,
-		Size:      size,
+		SizeStr:   sizeStr,
 		WriteMode: gluttonpb.WriteMode_WRITE_MODE_TRUNCATE,
 	})
 	if err != nil {
@@ -409,7 +396,7 @@ func (u *gluttonUser) writeRAMChunk(ctx context.Context, key string, size int32)
 		return err
 	}
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("WriteRAM %s (%d bytes): HTTP %d: %s", key, size, resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return fmt.Errorf("WriteRAM %s (%s bytes): HTTP %d: %s", key, sizeStr, resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 	return nil
 }

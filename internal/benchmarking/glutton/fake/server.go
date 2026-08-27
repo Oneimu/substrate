@@ -60,7 +60,7 @@ type Server struct {
 	paths         []string
 	writeSizes    []int32
 	readModes     []gluttonpb.ReadMode
-	ramWriteSizes []int32
+	ramWriteSizes []string
 }
 
 func (s *Server) reportedDigest() []byte {
@@ -103,10 +103,11 @@ func (s *Server) RecordedReadModes() []gluttonpb.ReadMode {
 	return append([]gluttonpb.ReadMode(nil), s.readModes...)
 }
 
-func (s *Server) RecordedRAMWriteSizes() []int32 {
+// RecordedRAMWriteSizes returns each /writeram request's size_str.
+func (s *Server) RecordedRAMWriteSizes() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]int32(nil), s.ramWriteSizes...)
+	return append([]string(nil), s.ramWriteSizes...)
 }
 
 func (s *Server) Start(t *testing.T) *httptest.Server {
@@ -187,7 +188,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.mu.Lock()
-		s.ramWriteSizes = append(s.ramWriteSizes, req.GetSize())
+		s.ramWriteSizes = append(s.ramWriteSizes, req.GetSizeStr())
 		s.mu.Unlock()
 
 		resp, _ := proto.Marshal(&gluttonpb.WriteRAMResponse{})

@@ -185,9 +185,6 @@ func newMux(svc *gluttonService) *http.ServeMux {
 	mux.HandleFunc("/ping", protoRoute("Ping", svc.Ping))
 	mux.HandleFunc("/writedisk", protoRoute("WriteDisk", svc.WriteDisk))
 	mux.HandleFunc("/readdisk", protoRoute("ReadDisk", svc.ReadDisk))
-	// WriteRAM is how benchmark drivers give an actor a resident working set
-	// in http mode: the boomer GluttonUser fills to its configured target so
-	// suspend/resume runs against realistically-sized memory.
 	mux.HandleFunc("/writeram", protoRoute("WriteRAM", svc.WriteRAM))
 	return mux
 }
@@ -388,10 +385,17 @@ func (s *gluttonService) WriteRAM(ctx context.Context, req *glutton.WriteRAMRequ
 	if req.GetKey() == "" {
 		return nil, status.Error(codes.InvalidArgument, "key is required")
 	}
-	if req.GetSize() < 0 {
+	size64 := int64(req.GetSize())
+	if s := req.GetSizeStr(); s != "" {
+		var err error
+		if size64, err = parseBytes(s); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "size_str: %v", err)
+		}
+	}
+	if size64 < 0 {
 		return nil, status.Error(codes.InvalidArgument, "size must be non-negative")
 	}
-	size := int(req.GetSize())
+	size := int(size64)
 
 	switch req.GetWriteMode() {
 	case glutton.WriteMode_WRITE_MODE_TRUNCATE:
