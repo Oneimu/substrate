@@ -54,6 +54,44 @@ type streamingMemStore struct{ *memStore }
 
 func (s *streamingMemStore) supportsStreamingPut() {}
 
+// assertUploadStats checks the byte counts an upload reported: the logical
+// size exactly, the populated bytes between the data written into the sparse
+// source and the logical size (the filesystem may round extents up to block
+// granularity, or report no holes at all), and the wire bytes exactly the
+// stored object's size.
+func assertUploadStats(t *testing.T, s UploadStats, logical, minPopulated, wire int64, sparse bool) {
+	t.Helper()
+	if s.LogicalBytes != logical {
+		t.Errorf("upload LogicalBytes = %d, want %d", s.LogicalBytes, logical)
+	}
+	if s.PopulatedBytes < minPopulated || s.PopulatedBytes > logical {
+		t.Errorf("upload PopulatedBytes = %d, want in [%d, %d]", s.PopulatedBytes, minPopulated, logical)
+	}
+	if s.WireBytes != wire {
+		t.Errorf("upload WireBytes = %d, want %d (the stored object's size)", s.WireBytes, wire)
+	}
+	if s.Sparse != sparse {
+		t.Errorf("upload Sparse = %v, want %v", s.Sparse, sparse)
+	}
+}
+
+// assertDownloadStats mirrors assertUploadStats for the fetch side.
+func assertDownloadStats(t *testing.T, s DownloadStats, logical, minPopulated, wire int64, sparse bool) {
+	t.Helper()
+	if s.LogicalBytes != logical {
+		t.Errorf("download LogicalBytes = %d, want %d", s.LogicalBytes, logical)
+	}
+	if s.PopulatedBytes < minPopulated || s.PopulatedBytes > logical {
+		t.Errorf("download PopulatedBytes = %d, want in [%d, %d]", s.PopulatedBytes, minPopulated, logical)
+	}
+	if s.WireBytes != wire {
+		t.Errorf("download WireBytes = %d, want %d (the stored object's size)", s.WireBytes, wire)
+	}
+	if s.Sparse != sparse {
+		t.Errorf("download Sparse = %v, want %v", s.Sparse, sparse)
+	}
+}
+
 // TestSparseUploadStreamingRoundTrip drives the STREAMING upload path (GCS-like
 // backend) end-to-end through the real entry points: the object must still be the
 // sparse-extent format (magic) and download byte-exact. This guards the pipe path
@@ -86,7 +124,8 @@ func TestSparseUploadStreamingRoundTrip(t *testing.T) {
 	store := &streamingMemStore{newMemStore()}
 	ctx := context.Background()
 	const gsURL = "gs://bucket/snap/memory-ranges.zstd"
-	if err := SendLocalFileToGCSWithZstd(ctx, store, gsURL, srcPath); err != nil {
+	up, err := SendLocalFileToGCSWithZstd(ctx, store, gsURL, srcPath)
+	if err != nil {
 		t.Fatalf("streaming upload: %v", err)
 	}
 	stored := store.m["bucket/snap/memory-ranges.zstd"]
@@ -96,10 +135,13 @@ func TestSparseUploadStreamingRoundTrip(t *testing.T) {
 	if int64(len(stored)) >= size/2 {
 		t.Errorf("stored %d bytes; expected far less than logical %d (holes not skipped)", len(stored), size)
 	}
+	assertUploadStats(t, up, size, int64(4096+70000+5000), int64(len(stored)), true)
 	dstPath := filepath.Join(dir, "restored")
-	if err := FetchLocalFileFromGCSWithZstd(ctx, store, gsURL, dstPath); err != nil {
+	down, err := FetchLocalFileFromGCSWithZstd(ctx, store, gsURL, dstPath)
+	if err != nil {
 		t.Fatalf("download: %v", err)
 	}
+	assertDownloadStats(t, down, size, int64(4096+70000+5000), int64(len(stored)), true)
 	got, err := os.ReadFile(dstPath)
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +190,8 @@ func TestSparseUploadDownloadRoundTrip(t *testing.T) {
 	store := newMemStore()
 	ctx := context.Background()
 	const gsURL = "gs://bucket/snap/memory-ranges.zstd"
-	if err := SendLocalFileToGCSWithZstd(ctx, store, gsURL, srcPath); err != nil {
+	up, err := SendLocalFileToGCSWithZstd(ctx, store, gsURL, srcPath)
+	if err != nil {
 		t.Fatalf("upload: %v", err)
 	}
 	// The stored object must use the sparse-extent format (magic header).
@@ -160,11 +203,14 @@ func TestSparseUploadDownloadRoundTrip(t *testing.T) {
 	if int64(len(stored)) >= size/2 {
 		t.Errorf("stored %d bytes; expected far less than logical %d (holes not skipped)", len(stored), size)
 	}
+	assertUploadStats(t, up, size, int64(4096+70000+5000), int64(len(stored)), true)
 
 	dstPath := filepath.Join(dir, "restored")
-	if err := FetchLocalFileFromGCSWithZstd(ctx, store, gsURL, dstPath); err != nil {
+	down, err := FetchLocalFileFromGCSWithZstd(ctx, store, gsURL, dstPath)
+	if err != nil {
 		t.Fatalf("download: %v", err)
 	}
+	assertDownloadStats(t, down, size, int64(4096+70000+5000), int64(len(stored)), true)
 	got, err := os.ReadFile(dstPath)
 	if err != nil {
 		t.Fatal(err)
@@ -221,7 +267,7 @@ func TestSparseVersionRejected(t *testing.T) {
 	}
 	defer out.Close()
 	// readSparseZstd is called with the reader positioned just after the magic.
-	if _, err := readSparseZstd(out, bytes.NewReader(blob[len(sparseMagic):])); err == nil {
+	if _, _, err := readSparseZstd(out, bytes.NewReader(blob[len(sparseMagic):])); err == nil {
 		t.Fatal("expected an unsupported-version error, got nil")
 	}
 }
@@ -282,17 +328,33 @@ func TestPlainZstdBackwardCompatRoundTrip(t *testing.T) {
 	const gsURL = "gs://bucket/snap/config.json.zstd"
 	// SendBytesToGCS is uncompressed; use sendZstd with a non-file reader to
 	// hit the plain-zstd branch (no magic).
-	if err := sendZstd(ctx, store, gsURL, bytes.NewReader(want)); err != nil {
+	up, err := sendZstd(ctx, store, gsURL, bytes.NewReader(want))
+	if err != nil {
 		t.Fatalf("upload: %v", err)
 	}
 	stored := store.m["bucket/snap/config.json.zstd"]
 	if len(stored) >= len(sparseMagic) && string(stored[:len(sparseMagic)]) == sparseMagic {
 		t.Fatal("non-file upload unexpectedly used the sparse-extent format")
 	}
+	if up.Sparse {
+		t.Error("plain-zstd upload reported Sparse")
+	}
+	if up.WireBytes != int64(len(stored)) {
+		t.Errorf("upload WireBytes = %d, want %d (the stored object's size)", up.WireBytes, len(stored))
+	}
 	dir := t.TempDir()
 	dstPath := filepath.Join(dir, "config.json")
-	if err := FetchLocalFileFromGCSWithZstd(ctx, store, gsURL, dstPath); err != nil {
+	down, err := FetchLocalFileFromGCSWithZstd(ctx, store, gsURL, dstPath)
+	if err != nil {
 		t.Fatalf("download: %v", err)
+	}
+	// A dense payload: everything logical is populated.
+	if down.LogicalBytes != int64(len(want)) || down.PopulatedBytes != int64(len(want)) {
+		t.Errorf("download logical/populated = %d/%d, want %d/%d",
+			down.LogicalBytes, down.PopulatedBytes, len(want), len(want))
+	}
+	if down.WireBytes != int64(len(stored)) {
+		t.Errorf("download WireBytes = %d, want %d (the stored object's size)", down.WireBytes, len(stored))
 	}
 	got, err := os.ReadFile(dstPath)
 	if err != nil {

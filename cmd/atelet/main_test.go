@@ -1029,7 +1029,8 @@ func TestDownloadCombinedCheckpoint(t *testing.T) {
 		goldenSnapshotURI,
 		dstDir,
 		[]string{"durable-dir.tar"},
-		[]string{"config.json", "memory-ranges", "durable-dir.tar"})
+		[]string{"config.json", "memory-ranges", "durable-dir.tar"},
+		"ate-demo", "counter")
 	if err != nil {
 		t.Fatalf("downloadCombinedCheckpoint: %v", err)
 	}

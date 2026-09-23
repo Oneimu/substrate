@@ -68,7 +68,7 @@ func TestS3UploadAgainstRealServer(t *testing.T) {
 
 	start := time.Now()
 	url := fmt.Sprintf("gs://%s/bench/memory-ranges-%d.zstd", bucket, time.Now().UnixNano())
-	if err := SendLocalFileToGCSWithZstd(ctx, client, url, srcPath); err != nil {
+	if _, err := SendLocalFileToGCSWithZstd(ctx, client, url, srcPath); err != nil {
 		t.Fatalf("upload: %v", err)
 	}
 	d := time.Since(start)
@@ -78,7 +78,7 @@ func TestS3UploadAgainstRealServer(t *testing.T) {
 	// A multipart upload that reassembles wrong is worse than a slow one: pull the
 	// object back and compare it to the source byte for byte.
 	dst := filepath.Join(t.TempDir(), "restored")
-	if err := FetchLocalFileFromGCSWithZstd(ctx, client, url, dst); err != nil {
+	if _, err := FetchLocalFileFromGCSWithZstd(ctx, client, url, dst); err != nil {
 		t.Fatalf("download: %v", err)
 	}
 	if got, want := sha256File(t, dst), sha256File(t, srcPath); got != want {

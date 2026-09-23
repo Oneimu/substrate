@@ -108,8 +108,19 @@ func TestMergeDeltaIntoBase(t *testing.T) {
 	writeSparse(t, base, size, baseRegions)
 	writeSparse(t, delta, size, deltaRegions)
 
-	if err := MergeDeltaIntoBase(ctx, base, delta); err != nil {
+	deltaBytes, err := MergeDeltaIntoBase(ctx, base, delta)
+	if err != nil {
 		t.Fatalf("MergeDeltaIntoBase: %v", err)
+	}
+	// The reported delta size is what the overlay actually copied: at least the
+	// bytes written into the delta (the filesystem may round its data extents
+	// up to block granularity), and never the whole logical image.
+	deltaWritten := int64(0)
+	for _, r := range deltaRegions {
+		deltaWritten += int64(len(r.data))
+	}
+	if deltaBytes < deltaWritten || deltaBytes >= size {
+		t.Errorf("MergeDeltaIntoBase delta bytes = %d, want in [%d, %d)", deltaBytes, deltaWritten, int64(size))
 	}
 	got, err := os.ReadFile(delta)
 	if err != nil {
@@ -137,8 +148,12 @@ func TestMergeDeltaIntoBase(t *testing.T) {
 	rdelta := filepath.Join(rdir, "memory-ranges-delta")
 	writeSparse(t, rbase, size, baseRegions)
 	writeSparse(t, rdelta, size, deltaRegions)
-	if err := MergeSparseOverlay(ctx, rbase, rdelta, rdelta); err != nil {
+	refDeltaBytes, err := MergeSparseOverlay(ctx, rbase, rdelta, rdelta)
+	if err != nil {
 		t.Fatalf("MergeSparseOverlay: %v", err)
+	}
+	if refDeltaBytes != deltaBytes {
+		t.Errorf("MergeSparseOverlay delta bytes = %d, MergeDeltaIntoBase reported %d; the two merges read the same delta", refDeltaBytes, deltaBytes)
 	}
 	ref, err := os.ReadFile(rdelta)
 	if err != nil {
@@ -171,8 +186,12 @@ func TestMergeSparseOverlayNewOutFile(t *testing.T) {
 	writeSparse(t, base, size, baseRegions)
 	writeSparse(t, delta, size, deltaRegions)
 
-	if err := MergeSparseOverlay(context.Background(), base, delta, out); err != nil {
+	deltaBytes, err := MergeSparseOverlay(context.Background(), base, delta, out)
+	if err != nil {
 		t.Fatalf("MergeSparseOverlay: %v", err)
+	}
+	if deltaBytes < int64(len(deltaRegions[0].data)) || deltaBytes >= size {
+		t.Errorf("MergeSparseOverlay delta bytes = %d, want in [%d, %d)", deltaBytes, len(deltaRegions[0].data), int64(size))
 	}
 	got, err := os.ReadFile(out)
 	if err != nil {
@@ -192,7 +211,7 @@ func TestMergeDeltaIntoBaseSizeMismatch(t *testing.T) {
 	delta := filepath.Join(dir, "delta")
 	writeSparse(t, base, 1<<20, []region{{off: 0, data: fill(1, 4096)}})
 	writeSparse(t, delta, 2<<20, []region{{off: 0, data: fill(2, 4096)}})
-	if err := MergeDeltaIntoBase(context.Background(), base, delta); err == nil {
+	if _, err := MergeDeltaIntoBase(context.Background(), base, delta); err == nil {
 		t.Fatal("expected size-mismatch error, got nil")
 	}
 	// base must be untouched (no destructive rename happened before the check).
