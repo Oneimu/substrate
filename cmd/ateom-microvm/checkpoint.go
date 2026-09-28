@@ -71,6 +71,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	defer cancel()
 	defer s.inFlight.Add(req.GetActorUid(), rpcCheckpointWorkload, nil)()
 
+	tStart := time.Now()
 	attribution := ateomstats.ActorAttributionFromRequest(req)
 	if err := s.deactivateActorNetworking(ctx, attribution); err != nil {
 		return nil, err
@@ -207,6 +208,20 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		// rootfs_upper), and the tar durations scale with the actor's data.
 		slog.Duration("durable_dir", dDurable), slog.Duration("rootfs_upper", dUpper),
 		slog.Duration("teardown", dTeardown))
+
+	// The joinable per-actor record the benchmarking tooling aggregates. The
+	// snapshot, durable_dir and rootfs_upper captures run concurrently on the
+	// paused guest, so those three are independent observations rather than a
+	// partition of the total.
+	logSnapshotPhases(ctx, "Checkpoint timing breakdown", attribution, scope,
+		checkpointDurationKey, []phase{
+			{phasePause, dPause},
+			{phaseSnapshot, dSnapshot},
+			{phaseDurableDir, dDurable},
+			{phaseRootfsUpper, dUpper},
+			{phaseTeardown, dTeardown},
+			{phaseTotal, time.Since(tStart)},
+		})
 	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
 }
 
