@@ -613,8 +613,8 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	}
 	defer func() {
 		// Use the same phase values for metrics and logs so their durations stay
-        // consistent. The log also includes actor identity, which is intentionally
-        // excluded from metric labels because of cardinality.
+		// consistent. The log also includes actor identity, which is intentionally
+		// excluded from metric labels because of cardinality.
 		phases := []phase{
 			{ateattr.SnapshotPhaseSandboxAssets, dAssets},
 			{ateattr.SnapshotPhaseAteomCheckpoint, dAteom},
