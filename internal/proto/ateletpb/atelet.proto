@@ -382,6 +382,16 @@ enum SnapshotScope {
   SNAPSHOT_SCOPE_DATA_ON_GOLDEN = 3;
 }
 
+// ExternalRestoreConfiguration is an external snapshot a restore reads.
+// Split from the checkpoint-side ExternalCheckpointConfiguration (a write
+// destination) so read-side attributes of a restore source have a home.
+message ExternalRestoreConfiguration {
+  // The object storage URI of the snapshot to read. Object names are
+  // appended to it, so it addresses the snapshot as a whole rather than any
+  // one object.
+  string snapshot_uri = 1;
+}
+
 message CheckpointRequest {
   string target_ateom_uid = 1;
 
@@ -449,9 +459,6 @@ message RestoreRequest {
   string actor_template_atespace = 5;
   string actor_template_name = 6;
 
-  // Sandbox binary config is not sent on restore: the snapshot is
-  // self-describing. atelet reads the snapshot manifest to recover the pinned
-  // sandbox version that created it.
   WorkloadSpec spec = 7;
 
   CheckpointType type = 8;
@@ -459,19 +466,17 @@ message RestoreRequest {
   // The checkpoint configuration, depending on the type.
   oneof config {
     LocalCheckpointConfiguration local_config = 9;
-    ExternalCheckpointConfiguration external_config = 10;
+    ExternalRestoreConfiguration external_config = 10;
   }
 
   // What content to restore from the checkpoint.
   SnapshotScope scope = 11;
 
-  // The object storage URI of the ActorTemplate's golden snapshot.
-  // Set only when scope is SNAPSHOT_SCOPE_DATA_ON_GOLDEN: restore combines
-  // the golden snapshot (memory + full fs delta) with the durable data in
-  // the snapshot referenced by `config`. A top-level field rather than part
-  // of the `config` oneof: the actor's snapshot may be local (a pause
-  // checkpoint) while the golden snapshot is always external.
-  string golden_snapshot_uri = 12;
+  // The base guest state (memory + rootfs delta) combined with `config`'s
+  // durable data when scope is SNAPSHOT_SCOPE_DATA_ON_GOLDEN. A top-level
+  // field rather than part of the `config` oneof: the actor's snapshot may
+  // be local (a pause checkpoint) while the base is always external.
+  ExternalRestoreConfiguration base_config = 12;
 
   // When absent the actor has no egress: its TCP is captured and refused.
   optional EgressGateway egress_gateway = 13;
@@ -482,6 +487,10 @@ message RestoreRequest {
   // means "unset": keep the runtime default.
   int64 cpu_milli = 14;    // CPU limit in millicores (1000 = one core).
   int64 memory_bytes = 15; // Memory limit in bytes.
+
+  // The sandbox binaries and pause image to restore with, resolved from the
+  // ActorTemplate's SandboxConfig. Required.
+  SandboxAssets sandbox_assets = 16;
 }
 
 message RestoreResponse {
