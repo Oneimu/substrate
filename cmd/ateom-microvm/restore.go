@@ -169,7 +169,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		// A cold boot has none of the full-scope phases, so the total is the
 		// only observation on its record.
 		logSnapshotPhases(ctx, "Restore timing breakdown", attribution, scope,
-			restoreDurationKey, []phase{{phaseTotal, dTotal}})
+			restoreDurationKey, nil, []phase{{phaseTotal, dTotal}})
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unsupported snapshot scope: %v", scope)
 	}
@@ -394,7 +394,7 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	// durable delta is not carried: tDurable is pinned to tLowers today, so it
 	// would always be the zero a record skips.
 	logSnapshotPhases(ctx, "Restore timing breakdown", p.actorAttribution(), scope,
-		restoreDurationKey, []phase{
+		restoreDurationKey, nil, []phase{
 			{phasePrep, tPrep.Sub(tStart)},
 			{phaseBundles, tBundles.Sub(tPrep)},
 			{phaseUpperJoin, tUpper.Sub(tBundles)},

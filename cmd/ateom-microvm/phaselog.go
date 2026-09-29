@@ -24,6 +24,8 @@ import (
 	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"github.com/agent-substrate/substrate/internal/resources"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // The keys the per-phase durations are logged under. They are named like
@@ -43,8 +45,8 @@ const (
 // layers' records agree on the denominator.
 //
 // Checkpoint: snapshot, durable_dir and rootfs_upper run concurrently on the
-// paused guest, so the paused window costs their max, not their sum; pause
-// and teardown are sequential around them. Restore: every phase is
+// paused guest, so the paused window costs their max, not their sum; prep,
+// pause and teardown are sequential around them. Restore: every phase is
 // sequential and the phases partition the total.
 const (
 	phasePause       = "pause"
@@ -96,9 +98,21 @@ func scopeLogValue(scope ateompb.SnapshotScope) string {
 // scope, and one float-seconds attr per non-zero phase under
 // durationKey.<phase>. One record carries every phase of the operation, so a
 // reader never joins two half-records that disagree about the same actor.
-func snapshotPhaseAttrs(a resources.ActorAttribution, scope ateompb.SnapshotScope, durationKey string, phases []phase) []slog.Attr {
+//
+// err is the operation's outcome. A failed operation still records the phases
+// it completed, marked with error.type (the gRPC code, context errors as
+// DeadlineExceeded / Canceled) so a reader can leave it out of a latency
+// distribution. Absence means success.
+func snapshotPhaseAttrs(a resources.ActorAttribution, scope ateompb.SnapshotScope, durationKey string, err error, phases []phase) []slog.Attr {
 	attrs := ateattr.ActorLogAttrs(a)
 	attrs = append(attrs, slog.String(string(ateattr.SnapshotScopeKey), scopeLogValue(scope)))
+	if err != nil {
+		code := status.Code(err)
+		if code == codes.Unknown {
+			code = status.FromContextError(err).Code()
+		}
+		attrs = append(attrs, slog.String(string(ateattr.ErrorTypeKey), code.String()))
+	}
 	for _, p := range phases {
 		if p.d == 0 {
 			continue
@@ -112,6 +126,6 @@ func snapshotPhaseAttrs(a resources.ActorAttribution, scope ateompb.SnapshotScop
 }
 
 // logSnapshotPhases emits the snapshotPhaseAttrs record under msg.
-func logSnapshotPhases(ctx context.Context, msg string, a resources.ActorAttribution, scope ateompb.SnapshotScope, durationKey string, phases []phase) {
-	slog.LogAttrs(ctx, slog.LevelInfo, msg, snapshotPhaseAttrs(a, scope, durationKey, phases)...)
+func logSnapshotPhases(ctx context.Context, msg string, a resources.ActorAttribution, scope ateompb.SnapshotScope, durationKey string, err error, phases []phase) {
+	slog.LogAttrs(ctx, slog.LevelInfo, msg, snapshotPhaseAttrs(a, scope, durationKey, err, phases)...)
 }

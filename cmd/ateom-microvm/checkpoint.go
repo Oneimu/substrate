@@ -61,7 +61,7 @@ import (
 //
 // Allow checkpointing even if the pod is shutting down. This will allow actors
 // (or the harness) to suspend on shutdown.
-func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.CheckpointWorkloadRequest) (*ateompb.CheckpointWorkloadResponse, error) {
+func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.CheckpointWorkloadRequest) (_ *ateompb.CheckpointWorkloadResponse, err error) {
 	if !s.locks.Lock(ctx, req.GetActorUid()) {
 		return nil, status.Error(codes.Canceled, "gave up waiting for the actor's lock")
 	}
@@ -71,8 +71,28 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	defer cancel()
 	defer s.inFlight.Add(req.GetActorUid(), rpcCheckpointWorkload, nil)()
 
+	// Per-phase timing, recorded on the way out so a failed checkpoint still
+	// reports the phases it completed, and the failing step its elapsed time.
+	// Phases left at zero never ran. The snapshot, durable_dir and rootfs_upper
+	// captures run concurrently on the paused guest, so those three are
+	// independent observations rather than a partition of the total.
 	tStart := time.Now()
+	var dPrep, dPause, dSnapshot, dDurable, dUpper, dTeardown time.Duration
 	attribution := ateomstats.ActorAttributionFromRequest(req)
+	scope := req.GetScope()
+	defer func() {
+		logSnapshotPhases(ctx, "Checkpoint timing breakdown", attribution, scope,
+			checkpointDurationKey, err, []phase{
+				{phasePrep, dPrep},
+				{phasePause, dPause},
+				{phaseSnapshot, dSnapshot},
+				{phaseDurableDir, dDurable},
+				{phaseRootfsUpper, dUpper},
+				{phaseTeardown, dTeardown},
+				{phaseTotal, time.Since(tStart)},
+			})
+	}()
+
 	if err := s.deactivateActorNetworking(ctx, attribution); err != nil {
 		return nil, err
 	}
@@ -91,7 +111,6 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// here as plain DATA) and lands in the default rejection.
 	durable := hasDurableVolumes(req.GetSpec().GetContainers())
 	csi := hasCsiVolumes(req.GetSpec().GetContainers())
-	scope := req.GetScope()
 	switch scope {
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL:
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
@@ -117,10 +136,12 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	}
 
 	tPause := time.Now()
-	if err := client.Pause(ctx); err != nil {
-		return nil, fmt.Errorf("while pausing guest: %w", err)
+	dPrep = tPause.Sub(tStart)
+	pauseErr := client.Pause(ctx)
+	dPause = time.Since(tPause)
+	if pauseErr != nil {
+		return nil, fmt.Errorf("while pausing guest: %w", pauseErr)
 	}
-	dPause := time.Since(tPause)
 
 	checkpointDir := ateompath.CheckpointStateDir(actorUID)
 	// Start from a clean dir so CH's snapshot files are the only contents.
@@ -147,33 +168,32 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	//   - Rootfs upper tar (Full only): host-backed like the durable volumes —
 	//     the memory snapshot does not carry rootfs writes. Under Data the
 	//     workload cold-starts on restore, discarding rootfs state.
-	var dSnapshot, dDurable, dUpper time.Duration
 	g, gctx := errgroup.WithContext(ctx)
 	if scope == ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL {
 		g.Go(func() error {
-			var err error
-			dSnapshot, err = s.snapshotVMState(gctx, client, ra, actorUID, checkpointDir)
+			t := time.Now()
+			d, err := s.snapshotVMState(gctx, client, ra, actorUID, checkpointDir)
+			if err != nil {
+				d = time.Since(t)
+			}
+			dSnapshot = d
 			return err
 		})
 	}
 	if durable {
 		g.Go(func() error {
 			t := time.Now()
-			if err := tarDurableVolumes(gctx, ateompath.DurableDirVolumeMountsDir(actorUID), checkpointDir); err != nil {
-				return err
-			}
+			err := tarDurableVolumes(gctx, ateompath.DurableDirVolumeMountsDir(actorUID), checkpointDir)
 			dDurable = time.Since(t)
-			return nil
+			return err
 		})
 	}
 	if scope == ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL {
 		g.Go(func() error {
 			t := time.Now()
-			if err := tarRootfsUpper(gctx, rootfsUpperDir(actorUID), checkpointDir); err != nil {
-				return err
-			}
+			err := tarRootfsUpper(gctx, rootfsUpperDir(actorUID), checkpointDir)
 			dUpper = time.Since(t)
-			return nil
+			return err
 		})
 	}
 	if err := g.Wait(); err != nil {
@@ -197,7 +217,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 			slog.String("actorUID", actorUID),
 			slog.Any("err", err))
 	}
-	dTeardown := time.Since(tTeardown)
+	dTeardown = time.Since(tTeardown)
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor checkpointed", attribution)
 	slog.InfoContext(ctx, "Actor checkpointed", slog.String("id", actorUID), slog.Any("snapshot_files", snapshotFiles),
@@ -208,20 +228,6 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		// rootfs_upper), and the tar durations scale with the actor's data.
 		slog.Duration("durable_dir", dDurable), slog.Duration("rootfs_upper", dUpper),
 		slog.Duration("teardown", dTeardown))
-
-	// The joinable per-actor record the benchmarking tooling aggregates. The
-	// snapshot, durable_dir and rootfs_upper captures run concurrently on the
-	// paused guest, so those three are independent observations rather than a
-	// partition of the total.
-	logSnapshotPhases(ctx, "Checkpoint timing breakdown", attribution, scope,
-		checkpointDurationKey, []phase{
-			{phasePause, dPause},
-			{phaseSnapshot, dSnapshot},
-			{phaseDurableDir, dDurable},
-			{phaseRootfsUpper, dUpper},
-			{phaseTeardown, dTeardown},
-			{phaseTotal, time.Since(tStart)},
-		})
 	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
 }
 

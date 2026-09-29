@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
@@ -55,7 +56,8 @@ func TestSnapshotPhaseAttrs(t *testing.T) {
 	t.Parallel()
 
 	attrs := snapshotPhaseAttrs(phaseLogAttribution(), ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL,
-		checkpointDurationKey, []phase{
+		checkpointDurationKey, nil, []phase{
+			{phasePrep, 40 * time.Millisecond},
 			{phasePause, 3 * time.Millisecond},
 			{phaseSnapshot, 850 * time.Millisecond},
 			// A capture that did not run stays off the record.
@@ -92,6 +94,7 @@ func TestSnapshotPhaseAttrs(t *testing.T) {
 	// Seconds, not slog.Duration's nanoseconds: the keys extend the atelet
 	// histograms' names, and those declare unit s.
 	for k, want := range map[string]float64{
+		"ateom.actor.checkpoint.duration.prep":     0.04,
 		"ateom.actor.checkpoint.duration.pause":    0.003,
 		"ateom.actor.checkpoint.duration.snapshot": 0.85,
 		"ateom.actor.checkpoint.duration.teardown": 0.23,
@@ -109,10 +112,50 @@ func TestSnapshotPhaseAttrs(t *testing.T) {
 		// The phase key names the one step a datapoint timed; this record
 		// carries them all.
 		"ate.snapshot.phase",
+		// Absent error.type is success, as on the instruments.
+		"error.type",
 	} {
 		if v, ok := rec[k]; ok {
 			t.Errorf("%s is present with %v, want absent", k, v)
 		}
+	}
+}
+
+// TestSnapshotPhaseAttrsFailure: a checkpoint that died keeps the phases it
+// completed and is marked, so a reader can exclude it from percentiles.
+func TestSnapshotPhaseAttrsFailure(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"a wrapped context deadline reports DeadlineExceeded",
+			fmt.Errorf("while snapshotting guest: %w", context.DeadlineExceeded), "DeadlineExceeded"},
+		{"a wrapped context cancellation reports Canceled",
+			fmt.Errorf("while pausing guest: %w", context.Canceled), "Canceled"},
+		{"a plain error is a bounded Unknown, not its message",
+			fmt.Errorf("while clearing checkpoint dir: disk on fire"), "Unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			rec := renderPhaseRecord(t, snapshotPhaseAttrs(phaseLogAttribution(),
+				ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL, checkpointDurationKey, tt.err,
+				[]phase{{phasePrep, 40 * time.Millisecond}, {phasePause, 3 * time.Millisecond}, {phaseTotal, 30 * time.Second}}))
+			if got := rec["error.type"]; got != tt.want {
+				t.Errorf("error.type = %v, want %q", got, tt.want)
+			}
+			// The phases that ran before the failure are still on the record;
+			// the ones that never started are not.
+			if _, ok := rec["ateom.actor.checkpoint.duration.pause"]; !ok {
+				t.Error("missing ateom.actor.checkpoint.duration.pause")
+			}
+			if v, ok := rec["ateom.actor.checkpoint.duration.snapshot"]; ok {
+				t.Errorf("snapshot phase present with %v, want absent", v)
+			}
+		})
 	}
 }
 
