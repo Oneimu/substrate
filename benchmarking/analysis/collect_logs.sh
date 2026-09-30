@@ -16,15 +16,24 @@
 # Dump the node-side logs a benchmark run needs for phase_report.py: every
 # atelet pod (the atelet-side timing breakdowns) and every worker pod
 # (ateom-microvm writes its records to the worker pod's stdout). Point
-# --since at the run's start so the report covers exactly one run.
+# --since-time (RFC 3339) or --since at the run's start so the report covers
+# exactly one run.
 #
-# Usage: collect_logs.sh --dest DIR [--since 30m] [--namespace ate-system]
-#                        [--worker-namespace benchmark-workloads]
+# kubectl logs returns only a container's current log file: once kubelet
+# rotates it under load, earlier records are gone, so collect soon after the
+# run. A container that restarted mid-run is dumped twice, its previous log
+# under <pod>.previous.log. On GKE, Cloud Logging keeps every record past
+# rotation and teardown; phase_report.py reads `gcloud logging read
+# --format json` output directly.
+#
+# Usage: collect_logs.sh --dest DIR [--since 30m | --since-time 2026-09-24T18:00:00Z]
+#                        [--namespace ate-system] [--worker-namespace benchmark-workloads]
 
-set -euo pipefail
+set -uo pipefail
 
 DEST=""
 SINCE="1h"
+SINCE_TIME=""
 NAMESPACE="ate-system"
 WORKER_NAMESPACE="benchmark-workloads"
 
@@ -32,6 +41,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dest) DEST="$2"; shift 2 ;;
     --since) SINCE="$2"; shift 2 ;;
+    --since-time) SINCE_TIME="$2"; shift 2 ;;
     --namespace) NAMESPACE="$2"; shift 2 ;;
     --worker-namespace) WORKER_NAMESPACE="$2"; shift 2 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
@@ -39,20 +49,42 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${DEST}" ]]; then
-  echo "usage: $0 --dest DIR [--since 30m] [--namespace ate-system] [--worker-namespace benchmark-workloads]" >&2
+  echo "usage: $0 --dest DIR [--since 30m | --since-time RFC3339] [--namespace ate-system] [--worker-namespace benchmark-workloads]" >&2
   exit 2
 fi
 mkdir -p "${DEST}"
 
+if [[ -n "${SINCE_TIME}" ]]; then
+  WINDOW=(--since-time="${SINCE_TIME}")
+else
+  WINDOW=(--since="${SINCE}")
+fi
+
+# One pod that cannot be read (still starting, evicted) must not cost the
+# others, so every kubectl call warns and moves on rather than aborting.
 collect() {
   local ns="$1" selector="$2"
   local pods
-  pods=$(kubectl get pods -n "${ns}" -l "${selector}" -o name)
+  if ! pods=$(kubectl get pods -n "${ns}" -l "${selector}" -o name); then
+    echo "warn: could not list pods in ${ns} (${selector}); skipping" >&2
+    return 0
+  fi
   for pod in ${pods}; do
     local name="${pod#pod/}"
-    echo "collecting ${ns}/${name} (since ${SINCE})"
-    kubectl logs -n "${ns}" "${name}" --since="${SINCE}" --timestamps=false \
-      > "${DEST}/${ns}-${name}.log"
+    echo "collecting ${ns}/${name} (${WINDOW[*]})"
+    kubectl logs -n "${ns}" "${name}" "${WINDOW[@]}" --timestamps=false \
+      > "${DEST}/${ns}-${name}.log" \
+      || { echo "warn: kubectl logs ${ns}/${name} failed; skipping" >&2; rm -f "${DEST}/${ns}-${name}.log"; }
+    # --previous is only valid after a restart; kubectl rejects it otherwise.
+    local restarts
+    restarts=$(kubectl get pod -n "${ns}" "${name}" \
+      -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo 0)
+    if [[ "${restarts:-0}" -gt 0 ]]; then
+      echo "collecting ${ns}/${name} previous container (${restarts} restarts)"
+      kubectl logs -n "${ns}" "${name}" --previous "${WINDOW[@]}" --timestamps=false \
+        > "${DEST}/${ns}-${name}.previous.log" \
+        || { echo "warn: kubectl logs --previous ${ns}/${name} failed; skipping" >&2; rm -f "${DEST}/${ns}-${name}.previous.log"; }
+    fi
   done
 }
 

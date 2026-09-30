@@ -15,9 +15,11 @@
 
 """Aggregate the suspend/resume phase-breakdown log records into a report.
 
-Reads JSON-lines logs (kubectl logs dumps of the atelet and worker pods; any
-non-JSON or unrelated lines are skipped) and aggregates the two joinable
-record kinds the node side emits, each written by both layers:
+Reads the atelet and worker pod logs, either as kubectl logs dumps (JSON
+lines; unrelated lines are skipped) or as a Cloud Logging export
+(`gcloud logging read --format json`: a JSON array of entries with the record
+under jsonPayload), and aggregates the two joinable record kinds the node
+side emits, each written by both layers:
 
   - "Restore timing breakdown"     atelet (ate.actor.restore.duration.*)
                                    and ateom (ateom.actor.restore.duration.*)
@@ -64,8 +66,13 @@ ACTOR_UID_KEY = "ate.actor.uid"
 SCOPE_KEY = "ate.snapshot.scope"
 PHASE_KEY = "ate.snapshot.phase"
 KIND_KEY = "ate.snapshot.kind"
+SANDBOX_CLASS_KEY = "ate.sandbox.class"
 TEMPLATE_KEY = "ate.template.name"
 ERROR_TYPE_KEY = "error.type"
+
+# Only ateom-microvm writes the ateom records, and they carry no sandbox
+# class of their own; the atelet record of the same operation does.
+ATEOM_SANDBOX_CLASS = "microvm"
 
 # The phase every record reports, and the one the report derives: the part of
 # the total no logged phase accounts for.
@@ -109,6 +116,7 @@ class Breakdown:
     ts: float | None  # epoch seconds parsed from time, None when unparseable
     actor_uid: str
     template: str
+    sandbox_class: str
     scope: str
     kind: str
     phases: dict[str, float]  # phase name -> seconds
@@ -120,6 +128,7 @@ class Parsed:
     breakdowns: list[Breakdown] = field(default_factory=list)
     lines_seen: int = 0
     lines_matched: int = 0
+    bad_values: int = 0  # duration keys whose value was not a number
 
 
 _TIME_RE = re.compile(r"^(.*T\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:?\d\d)?$")
@@ -163,14 +172,24 @@ def unattributed(source: str, op: str, phases: dict[str, float]) -> float | None
 
 
 def parse_line(obj: dict, out: Parsed) -> None:
+    # A Cloud Logging entry nests the record under jsonPayload and moves
+    # slog's time onto the entry's timestamp; a kubectl dump is the record.
+    payload = obj.get("jsonPayload")
+    if isinstance(payload, dict):
+        entry, obj = obj, dict(payload)
+        obj.setdefault("time", entry.get("timestamp", ""))
     msg = obj.get("msg", "")
     if msg in BREAKDOWN_MSGS:
         for (source, op), prefix in BREAKDOWN_PREFIXES.items():
-            phases = {
-                k[len(prefix):]: float(v)
-                for k, v in obj.items()
-                if k.startswith(prefix)
-            }
+            phases: dict[str, float] = {}
+            for k, v in obj.items():
+                if not k.startswith(prefix):
+                    continue
+                try:
+                    phases[k[len(prefix):]] = float(v)
+                except (TypeError, ValueError):
+                    # One bad value costs that phase, not the run's report.
+                    out.bad_values += 1
             if not phases:
                 continue
             residual = unattributed(source, op, phases)
@@ -183,6 +202,8 @@ def parse_line(obj: dict, out: Parsed) -> None:
                 ts=parse_time(obj.get("time", "")),
                 actor_uid=obj.get(ACTOR_UID_KEY, ""),
                 template=obj.get(TEMPLATE_KEY, ""),
+                sandbox_class=obj.get(SANDBOX_CLASS_KEY, "")
+                or (ATEOM_SANDBOX_CLASS if source == "ateom" else ""),
                 scope=obj.get(SCOPE_KEY, ""),
                 kind=obj.get(KIND_KEY, ""),
                 phases=phases,
@@ -197,19 +218,32 @@ def parse_files(paths: list[str]) -> Parsed:
     for path in paths:
         f = sys.stdin if path == "-" else open(path, encoding="utf-8", errors="replace")
         with f:
-            for line in f:
-                # kubectl log dumps may prefix each line (pod name, timestamp);
-                # recover the JSON object from the first brace.
-                brace = line.find("{")
-                if brace < 0:
-                    continue
-                out.lines_seen += 1
-                try:
-                    obj = json.loads(line[brace:])
-                except json.JSONDecodeError:
-                    continue
+            text = f.read()
+        if text.lstrip().startswith("["):
+            # A Cloud Logging export: one JSON array of entries, pretty-printed
+            # across lines, so it cannot be read line by line.
+            try:
+                entries = json.loads(text)
+            except json.JSONDecodeError:
+                entries = []
+            for obj in entries:
                 if isinstance(obj, dict):
+                    out.lines_seen += 1
                     parse_line(obj, out)
+            continue
+        for line in text.splitlines():
+            # kubectl log dumps may prefix each line (pod name, timestamp);
+            # recover the JSON object from the first brace.
+            brace = line.find("{")
+            if brace < 0:
+                continue
+            out.lines_seen += 1
+            try:
+                obj = json.loads(line[brace:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                parse_line(obj, out)
     return out
 
 
@@ -230,23 +264,27 @@ def fmt_s(seconds: float) -> str:
 
 
 def report_phases(breakdowns: list[Breakdown], writer) -> list[dict]:
-    """Per (source, op, scope, phase) percentiles. Returns the rows for CSV."""
+    """Per (source, op, sandbox class, kind, scope, phase) percentiles. A
+    golden restore (which downloads the golden image) and a latest restore,
+    or a gVisor and a micro-VM checkpoint, are different distributions and
+    must not be pooled. Returns the rows for CSV."""
     groups: dict[tuple, list[float]] = defaultdict(list)
     for b in breakdowns:
         if b.failed:
             continue
         for name, seconds in b.phases.items():
-            groups[(b.source, b.op, b.scope or "-", name)].append(seconds)
+            groups[(b.source, b.op, b.sandbox_class or "-", b.kind or "-", b.scope or "-", name)].append(seconds)
 
     rows = []
     writer("== Phase percentiles (ms) ==")
-    writer(f"{'layer':7} {'op':11} {'scope':15} {'phase':16} {'n':>5} "
+    writer(f"{'layer':7} {'op':11} {'class':8} {'kind':7} {'scope':15} {'phase':16} {'n':>5} "
            f"{'p50':>8} {'p90':>8} {'p95':>8} {'max':>8}")
-    for key in sorted(groups, key=lambda k: (k[0], k[1], k[2], phase_sort_key(k[3]))):
+    for key in sorted(groups, key=lambda k: (k[:5], phase_sort_key(k[5]))):
         vals = sorted(groups[key])
-        source, op, scope, name = key
+        source, op, sandbox_class, kind, scope, name = key
         row = {
-            "layer": source, "op": op, "scope": scope, "phase": name,
+            "layer": source, "op": op, "class": sandbox_class, "kind": kind,
+            "scope": scope, "phase": name,
             "count": len(vals),
             "p50_ms": percentile(vals, 50) * 1000,
             "p90_ms": percentile(vals, 90) * 1000,
@@ -254,7 +292,7 @@ def report_phases(breakdowns: list[Breakdown], writer) -> list[dict]:
             "max_ms": max(vals) * 1000,
         }
         rows.append(row)
-        writer(f"{source:7} {op:11} {scope:15} {name:16} {len(vals):5d} "
+        writer(f"{source:7} {op:11} {sandbox_class:8} {kind:7} {scope:15} {name:16} {len(vals):5d} "
                f"{fmt_s(percentile(vals, 50))} {fmt_s(percentile(vals, 90))} "
                f"{fmt_s(percentile(vals, 95))} {fmt_s(max(vals))}")
     failed = sum(1 for b in breakdowns if b.failed)
@@ -264,11 +302,18 @@ def report_phases(breakdowns: list[Breakdown], writer) -> list[dict]:
 
 
 def inner_record(op: Breakdown, by_actor: dict[tuple, list[Breakdown]]) -> Breakdown | None:
-    """The ateom record of the same actor and op nearest before op's own: one
-    cycle emits exactly one of each, and the ateom one lands first, inside
-    the atelet ateom_* phase."""
+    """The successful ateom record of the same actor and op inside op's own
+    window (its record time minus its total): one cycle emits exactly one of
+    each, and the ateom one lands first, inside the atelet ateom_* phase. An
+    older record belongs to an earlier cycle whose partner is missing (pod
+    gone, log rotated, window cut), and pairing it would print a gap that
+    never happened, so nothing is better than the wrong one."""
+    total = op.phases.get(TOTAL)
+    if op.ts is None or total is None:
+        return None
+    lo, hi = op.ts - total - JOIN_SLACK_S, op.ts + JOIN_SLACK_S
     candidates = [a for a in by_actor.get((op.actor_uid, op.op), [])
-                  if a.ts is not None and op.ts is not None and a.ts <= op.ts + JOIN_SLACK_S]
+                  if not a.failed and a.ts is not None and lo <= a.ts <= hi]
     return candidates[-1] if candidates else None
 
 
@@ -292,7 +337,7 @@ def report_waterfalls(breakdowns: list[Breakdown], writer, slowest: int) -> None
         inner = inner_record(b, by_actor)
         total = b.phases.get(TOTAL, 0)
         writer(f"{b.op} actor={b.actor_uid} template={b.template} "
-               f"scope={b.scope or '-'} kind={b.kind or '-'} "
+               f"class={b.sandbox_class or '-'} scope={b.scope or '-'} kind={b.kind or '-'} "
                f"total={total * 1000:.1f}")
         for name in sorted(b.phases, key=phase_sort_key):
             if name == TOTAL:
@@ -321,7 +366,10 @@ def write_csv(dest: Path, name: str, rows: list[dict]) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("logs", nargs="+", help="JSON-lines log files ('-' for stdin)")
+    ap.add_argument("logs", nargs="+",
+                    help="kubectl logs dumps (JSON lines) or Cloud Logging exports "
+                         "(JSON array, as gcloud logging read --format json writes); "
+                         "'-' for stdin")
     ap.add_argument("--csv", type=Path, default=None,
                     help="also write phase_percentiles.csv here")
     ap.add_argument("--slowest", type=int, default=3,
@@ -330,7 +378,9 @@ def main() -> int:
 
     parsed = parse_files(args.logs)
     print(f"parsed {parsed.lines_matched} timing breakdown records "
-          f"out of {parsed.lines_seen} JSON log lines")
+          f"out of {parsed.lines_seen} JSON log entries")
+    if parsed.bad_values:
+        print(f"(skipped {parsed.bad_values} non-numeric duration values)")
     if not parsed.breakdowns:
         print("no matching records; are these the atelet and worker pod logs?", file=sys.stderr)
         return 1

@@ -86,6 +86,33 @@ ATEOM_CHECKPOINT = {
     "ateom.actor.checkpoint.duration.total": 1.2,
 }
 
+# The same actor's ateom restore record from an hour earlier: a different
+# cycle, whose own atelet partner is missing from the dump.
+ATEOM_RESTORE_STALE = dict(ATEOM_RESTORE, time="2026-09-23T09:00:05.400000000Z")
+
+# One entry as `gcloud logging read --format json` writes it, trimmed to the
+# fields that matter: the record under jsonPayload, slog's time promoted to
+# the entry's timestamp, dotted keys kept as they are.
+CLOUD_LOGGING_ENTRY = {
+    "insertId": "m9xljnzmzppup1vj",
+    "jsonPayload": {
+        "ate.actor.checkpoint.duration.ateom_checkpoint": 1.024788329,
+        "ate.actor.checkpoint.duration.persist": 4.18451256,
+        "ate.actor.checkpoint.duration.sandbox_assets": 2.4358e-05,
+        "ate.actor.checkpoint.duration.total": 5.385861508,
+        "ate.actor.name": "sb-d790f7ed", "ate.actor.uid": "cc7a2ac7",
+        "ate.atespace": "benchmark", "ate.sandbox.class": "microvm",
+        "ate.snapshot.kind": "latest", "ate.snapshot.scope": "full",
+        "ate.template.atespace": "benchmark-workloads", "ate.template.name": "glutton",
+        "level": "INFO", "msg": "Checkpoint timing breakdown",
+    },
+    "logName": "projects/p/logs/stdout",
+    "resource": {"labels": {"container_name": "atelet", "namespace_name": "ate-system"},
+                 "type": "k8s_container"},
+    "severity": "INFO",
+    "timestamp": "2026-09-28T17:49:47.665836237Z",
+}
+
 FAILED = {
     "time": "2026-09-23T10:02:00Z", "level": "INFO",
     "msg": "Restore timing breakdown",
@@ -116,6 +143,35 @@ class ParseTest(unittest.TestCase):
         b = parse(ATEOM_CHECKPOINT).breakdowns[0]
         self.assertEqual((b.source, b.op), ("ateom", "checkpoint"))
         self.assertEqual(b.phases["rootfs_upper"], 0.9)
+
+    def test_cloud_logging_entry_parses_with_the_entry_timestamp(self):
+        b = parse(CLOUD_LOGGING_ENTRY).breakdowns[0]
+        self.assertEqual((b.source, b.op), ("atelet", "checkpoint"))
+        self.assertEqual(b.time, "2026-09-28T17:49:47.665836237Z")
+        self.assertIsNotNone(b.ts)
+        self.assertEqual((b.sandbox_class, b.kind, b.scope), ("microvm", "latest", "full"))
+        self.assertAlmostEqual(b.phases["persist"], 4.18451256)
+
+    def test_cloud_logging_export_file_is_a_json_array(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "export.json")
+            with open(path, "w") as f:
+                json.dump([CLOUD_LOGGING_ENTRY, CLOUD_LOGGING_ENTRY], f, indent=2)
+            out = phase_report.parse_files([path])
+        self.assertEqual((out.lines_seen, len(out.breakdowns)), (2, 2))
+
+    def test_ateom_records_default_to_the_microvm_class(self):
+        out = parse(ATEOM_RESTORE, ATELET_RESTORE)
+        self.assertEqual(out.breakdowns[0].sandbox_class, "microvm")
+        self.assertEqual(out.breakdowns[1].sandbox_class, "")  # not on this fixture
+
+    def test_non_numeric_duration_is_skipped_not_fatal(self):
+        rec = dict(ATELET_RESTORE, **{"ate.actor.restore.duration.download": None,
+                                      "ate.actor.restore.duration.oci_unpack": "fast"})
+        out = parse(rec)
+        self.assertEqual(out.bad_values, 2)
+        self.assertEqual(out.breakdowns[0].phases["total"], 3.9)
+        self.assertNotIn("download", out.breakdowns[0].phases)
 
     def test_prefixed_kubectl_lines_still_parse(self):
         with tempfile.TemporaryDirectory() as d:
@@ -156,6 +212,22 @@ class ReportTest(unittest.TestCase):
         downloads = [r for r in rows if r["phase"] == "download"]
         self.assertEqual(len(downloads), 1)
         self.assertEqual(downloads[0]["count"], 1)  # the failed 30s never entered
+
+    def test_percentiles_split_by_sandbox_class_and_kind(self):
+        golden = dict(ATELET_RESTORE, **{"ate.snapshot.kind": "golden", "ate.sandbox.class": "gvisor",
+                                         "ate.actor.restore.duration.download": 9.0,
+                                         "ate.actor.restore.duration.total": 10.0})
+        latest = dict(ATELET_RESTORE, **{"ate.sandbox.class": "gvisor"})
+        rows = phase_report.report_phases(parse(golden, latest).breakdowns, lambda _: None)
+        downloads = {(r["class"], r["kind"]): r["p50_ms"] for r in rows if r["phase"] == "download"}
+        self.assertEqual(downloads, {("gvisor", "golden"): 9000.0, ("gvisor", "latest"): 2400.0})
+
+    def test_waterfall_ignores_an_ateom_record_from_another_cycle(self):
+        out = parse(ATEOM_RESTORE_STALE, ATELET_RESTORE)
+        text = render(phase_report.report_waterfalls, out.breakdowns, slowest=1)
+        self.assertIn("atelet ateom_restore", text)
+        self.assertNotIn("ateom  vm_restore", text)
+        self.assertNotIn("(gap)", text)
 
     def test_waterfall_nests_ateom_and_gap_under_atelet(self):
         out = parse(ATEOM_RESTORE, ATELET_RESTORE)

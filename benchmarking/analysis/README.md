@@ -32,14 +32,26 @@ A failed atelet operation still writes its record, marked with `error.type`
    teardown (or against a cluster you manage yourself):
 
    ```bash
-   ./collect_logs.sh --dest /tmp/run1 --since 30m
+   ./collect_logs.sh --dest /tmp/run1 --since-time 2026-09-24T18:00:00Z
    ```
 
-   `--namespace` (default `ate-system`) selects the atelet pods and
-   `--worker-namespace` (default `benchmark-workloads`) the worker pods; the
-   ateom records land in the worker pod's stdout.
+   `--since-time` (or a relative `--since 30m`) should cover the run and
+   nothing before it. `--namespace` (default `ate-system`) selects the atelet
+   pods and `--worker-namespace` (default `benchmark-workloads`) the worker
+   pods; the ateom records land in the worker pod's stdout. `kubectl logs`
+   returns only a container's current log file, so on a long or busy run
+   kubelet's rotation can drop earlier records — collect soon after the run.
+   A container that restarted mid-run is dumped twice (`<pod>.previous.log`).
 
-3. Aggregate:
+   On GKE the same records are in Cloud Logging, which keeps them past
+   rotation and teardown; an export is accepted as input directly:
+
+   ```bash
+   gcloud logging read '(jsonPayload.msg="Checkpoint timing breakdown" OR jsonPayload.msg="Restore timing breakdown") AND resource.labels.cluster_name="<cluster>" AND timestamp>="2026-09-24T18:00:00Z"' \
+     --project <project> --format json > /tmp/run1/export.json
+   ```
+
+3. Aggregate (kubectl dumps and Cloud Logging exports can be mixed):
 
    ```bash
    python3 phase_report.py /tmp/run1/*.log --csv /tmp/run1/report
@@ -47,8 +59,10 @@ A failed atelet operation still writes its record, marked with `error.type`
 
 ## Reading the report
 
-**Phase percentiles.** Per layer, operation, scope and phase: count, p50,
-p90, p95 and max. The atelet rows split a checkpoint between
+**Phase percentiles.** Per layer, operation, sandbox class, snapshot kind,
+scope and phase: count, p50, p90, p95 and max. A `golden` restore downloads
+the golden image and a `latest` one the actor's own, so they are separate
+rows, as are gVisor and micro-VM checkpoints. The atelet rows split a checkpoint between
 `sandbox_assets`, `ateom_checkpoint` and `persist`, and a restore between
 `volume_mount`, `manifest_fetch`, `sandbox_assets`, `download`, `oci_unpack`
 and `ateom_restore`. The ateom rows split the `ateom_*` phase further:
@@ -64,9 +78,11 @@ the two checkpoint layers the report derives an `unattributed` row: the total
 minus what the logged phases account for, counting the concurrent captures
 once. It is the time the instrumentation does not yet name.
 
-**Waterfalls.** The slowest operations, with the ateom record nested under
-the atelet `ateom_*` phase and that phase's gap to the ateom total (RPC and
-queueing between the layers). Tail outliers that blow up in one phase every
+**Waterfalls.** The slowest operations, with the ateom record of the same
+actor and time window nested under the atelet `ateom_*` phase and that
+phase's gap to the ateom total (RPC and queueing between the layers). An
+operation whose ateom record is missing prints without one rather than with
+another cycle's. Tail outliers that blow up in one phase every
 time are systematic; different phases each time are environmental.
 
 `--csv` also writes `phase_percentiles.csv` for run-over-run comparison.
