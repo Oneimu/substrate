@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Aggregate the suspend/resume phase-breakdown log records into a report.
+
+Reads JSON-lines logs (kubectl logs dumps of the atelet and worker pods; any
+non-JSON or unrelated lines are skipped) and aggregates the two joinable
+record kinds the node side emits, each written by both layers:
+
+  - "Restore timing breakdown"     atelet (ate.actor.restore.duration.*)
+                                   and ateom (ateom.actor.restore.duration.*)
+  - "Checkpoint timing breakdown"  atelet (ate.actor.checkpoint.duration.*)
+                                   and ateom (ateom.actor.checkpoint.duration.*)
+
+The report answers "where does the SuspendActor / ResumeActor time go":
+per-phase percentiles at each layer, and the slowest operations as nested
+waterfalls (the ateom record joined under the atelet record of the same
+actor).
+
+Usage:
+    phase_report.py run-logs/*.log [--csv DEST_DIR] [--slowest N]
+
+The records are developer-facing logs, not metric API; this reader is the
+consumer that makes them percentiles. See benchmarking/analysis/README.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import re
+import statistics
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+# The duration-key prefixes. Source of truth: cmd/atelet/metrics.go
+# (restoreDurationMetric, checkpointDurationMetric) and
+# cmd/ateom-microvm/phaselog.go.
+BREAKDOWN_PREFIXES = {
+    ("atelet", "restore"): "ate.actor.restore.duration.",
+    ("atelet", "checkpoint"): "ate.actor.checkpoint.duration.",
+    ("ateom", "restore"): "ateom.actor.restore.duration.",
+    ("ateom", "checkpoint"): "ateom.actor.checkpoint.duration.",
+}
+BREAKDOWN_MSGS = {"Restore timing breakdown", "Checkpoint timing breakdown"}
+
+ACTOR_UID_KEY = "ate.actor.uid"
+SCOPE_KEY = "ate.snapshot.scope"
+PHASE_KEY = "ate.snapshot.phase"
+KIND_KEY = "ate.snapshot.kind"
+TEMPLATE_KEY = "ate.template.name"
+ERROR_TYPE_KEY = "error.type"
+
+# The phase every record reports, and the one the report derives: the part of
+# the total no logged phase accounts for.
+TOTAL = "total"
+UNATTRIBUTED = "unattributed"
+
+# Sequential order of the known phases, for display. Phases absent from a
+# record simply don't print; unknown phases print after, in input order.
+PHASE_ORDER = [
+    # atelet restore
+    "volume_mount", "manifest_fetch", "sandbox_assets", "download",
+    "oci_unpack", "ateom_restore",
+    # ateom restore
+    "prep", "bundles", "upper_join", "lowers", "tap", "vmm_launch",
+    "vm_restore", "resume", "wakeup_probe",
+    # atelet + ateom checkpoint
+    "pause", "snapshot", "durable_dir", "rootfs_upper",
+    "ateom_checkpoint", "teardown", "persist",
+    UNATTRIBUTED, TOTAL,
+]
+_PHASE_RANK = {name: i for i, name in enumerate(PHASE_ORDER)}
+
+# Which atelet phase wraps the ateom record.
+INNER_PHASE = {"restore": "ateom_restore", "checkpoint": "ateom_checkpoint"}
+
+# The ateom checkpoint captures that run concurrently on the paused guest: the
+# paused window costs their max, not their sum.
+CONCURRENT_CAPTURES = ("snapshot", "durable_dir", "rootfs_upper")
+
+# Slack when matching the ateom record to the atelet record of the same
+# operation: the ateom one is emitted a hair before the atelet one.
+JOIN_SLACK_S = 1.0
+
+
+@dataclass
+class Breakdown:
+    """One parsed timing-breakdown record."""
+    source: str  # atelet | ateom
+    op: str  # restore | checkpoint
+    time: str
+    ts: float | None  # epoch seconds parsed from time, None when unparseable
+    actor_uid: str
+    template: str
+    scope: str
+    kind: str
+    phases: dict[str, float]  # phase name -> seconds
+    failed: bool
+
+
+@dataclass
+class Parsed:
+    breakdowns: list[Breakdown] = field(default_factory=list)
+    lines_seen: int = 0
+    lines_matched: int = 0
+
+
+_TIME_RE = re.compile(r"^(.*T\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:?\d\d)?$")
+
+
+def parse_time(s: str) -> float | None:
+    """RFC 3339 -> epoch seconds. slog writes nanoseconds, which fromisoformat
+    rejects, so the fraction is trimmed to microseconds. None when unparseable
+    (a record then still counts, it just cannot be joined by time)."""
+    m = _TIME_RE.match(s.strip()) if s else None
+    if not m:
+        return None
+    base, frac, tz = m.groups()
+    frac = (frac or "")[:7]
+    tz = "+00:00" if tz in (None, "Z") else tz
+    try:
+        return datetime.fromisoformat(f"{base}{frac}{tz}").timestamp()
+    except ValueError:
+        return None
+
+
+def unattributed(source: str, op: str, phases: dict[str, float]) -> float | None:
+    """The total minus what the logged phases account for, where that is
+    well-defined: the atelet checkpoint phases are sequential; the ateom
+    checkpoint is prep, pause, the concurrent captures (max), then teardown.
+    The atelet restore phases overlap by design (download runs alongside the
+    asset fetch and OCI unpack) and the ateom restore phases partition their
+    total by construction, so neither gets a residual."""
+    total = phases.get(TOTAL)
+    if total is None:
+        return None
+    if (source, op) == ("atelet", "checkpoint"):
+        spent = sum(phases.get(p, 0.0) for p in ("sandbox_assets", "ateom_checkpoint", "persist"))
+    elif (source, op) == ("ateom", "checkpoint"):
+        spent = (phases.get("prep", 0.0) + phases.get("pause", 0.0)
+                 + max(phases.get(p, 0.0) for p in CONCURRENT_CAPTURES)
+                 + phases.get("teardown", 0.0))
+    else:
+        return None
+    return max(total - spent, 0.0)
+
+
+def parse_line(obj: dict, out: Parsed) -> None:
+    msg = obj.get("msg", "")
+    if msg in BREAKDOWN_MSGS:
+        for (source, op), prefix in BREAKDOWN_PREFIXES.items():
+            phases = {
+                k[len(prefix):]: float(v)
+                for k, v in obj.items()
+                if k.startswith(prefix)
+            }
+            if not phases:
+                continue
+            residual = unattributed(source, op, phases)
+            if residual is not None:
+                phases[UNATTRIBUTED] = residual
+            out.breakdowns.append(Breakdown(
+                source=source,
+                op=op,
+                time=obj.get("time", ""),
+                ts=parse_time(obj.get("time", "")),
+                actor_uid=obj.get(ACTOR_UID_KEY, ""),
+                template=obj.get(TEMPLATE_KEY, ""),
+                scope=obj.get(SCOPE_KEY, ""),
+                kind=obj.get(KIND_KEY, ""),
+                phases=phases,
+                failed=ERROR_TYPE_KEY in obj,
+            ))
+            out.lines_matched += 1
+            return
+
+
+def parse_files(paths: list[str]) -> Parsed:
+    out = Parsed()
+    for path in paths:
+        f = sys.stdin if path == "-" else open(path, encoding="utf-8", errors="replace")
+        with f:
+            for line in f:
+                # kubectl log dumps may prefix each line (pod name, timestamp);
+                # recover the JSON object from the first brace.
+                brace = line.find("{")
+                if brace < 0:
+                    continue
+                out.lines_seen += 1
+                try:
+                    obj = json.loads(line[brace:])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    parse_line(obj, out)
+    return out
+
+
+def percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    return statistics.quantiles(values, n=100, method="inclusive")[int(q) - 1]
+
+
+def phase_sort_key(name: str) -> tuple[int, str]:
+    return (_PHASE_RANK.get(name, len(PHASE_ORDER)), name)
+
+
+def fmt_s(seconds: float) -> str:
+    return f"{seconds * 1000:8.1f}"
+
+
+def report_phases(breakdowns: list[Breakdown], writer) -> list[dict]:
+    """Per (source, op, scope, phase) percentiles. Returns the rows for CSV."""
+    groups: dict[tuple, list[float]] = defaultdict(list)
+    for b in breakdowns:
+        if b.failed:
+            continue
+        for name, seconds in b.phases.items():
+            groups[(b.source, b.op, b.scope or "-", name)].append(seconds)
+
+    rows = []
+    writer("== Phase percentiles (ms) ==")
+    writer(f"{'layer':7} {'op':11} {'scope':15} {'phase':16} {'n':>5} "
+           f"{'p50':>8} {'p90':>8} {'p95':>8} {'max':>8}")
+    for key in sorted(groups, key=lambda k: (k[0], k[1], k[2], phase_sort_key(k[3]))):
+        vals = sorted(groups[key])
+        source, op, scope, name = key
+        row = {
+            "layer": source, "op": op, "scope": scope, "phase": name,
+            "count": len(vals),
+            "p50_ms": percentile(vals, 50) * 1000,
+            "p90_ms": percentile(vals, 90) * 1000,
+            "p95_ms": percentile(vals, 95) * 1000,
+            "max_ms": max(vals) * 1000,
+        }
+        rows.append(row)
+        writer(f"{source:7} {op:11} {scope:15} {name:16} {len(vals):5d} "
+               f"{fmt_s(percentile(vals, 50))} {fmt_s(percentile(vals, 90))} "
+               f"{fmt_s(percentile(vals, 95))} {fmt_s(max(vals))}")
+    failed = sum(1 for b in breakdowns if b.failed)
+    if failed:
+        writer(f"(excluded {failed} failed operation records)")
+    return rows
+
+
+def inner_record(op: Breakdown, by_actor: dict[tuple, list[Breakdown]]) -> Breakdown | None:
+    """The ateom record of the same actor and op nearest before op's own: one
+    cycle emits exactly one of each, and the ateom one lands first, inside
+    the atelet ateom_* phase."""
+    candidates = [a for a in by_actor.get((op.actor_uid, op.op), [])
+                  if a.ts is not None and op.ts is not None and a.ts <= op.ts + JOIN_SLACK_S]
+    return candidates[-1] if candidates else None
+
+
+def report_waterfalls(breakdowns: list[Breakdown], writer, slowest: int) -> None:
+    """The slowest operations: the ateom record nested under the atelet
+    ateom_* phase, and the gap between that phase and the ateom total (RPC
+    and queueing between the layers)."""
+    by_actor: dict[tuple, list[Breakdown]] = defaultdict(list)
+    for b in breakdowns:
+        if b.source == "ateom":
+            by_actor[(b.actor_uid, b.op)].append(b)
+    for v in by_actor.values():
+        v.sort(key=lambda b: (b.ts or 0.0, b.time))
+
+    atelet = [b for b in breakdowns if b.source == "atelet" and not b.failed]
+    atelet.sort(key=lambda b: b.phases.get(TOTAL, 0), reverse=True)
+
+    writer("")
+    writer(f"== Slowest {slowest} operations (waterfall, ms) ==")
+    for b in atelet[:slowest]:
+        inner = inner_record(b, by_actor)
+        total = b.phases.get(TOTAL, 0)
+        writer(f"{b.op} actor={b.actor_uid} template={b.template} "
+               f"scope={b.scope or '-'} kind={b.kind or '-'} "
+               f"total={total * 1000:.1f}")
+        for name in sorted(b.phases, key=phase_sort_key):
+            if name == TOTAL:
+                continue
+            writer(f"  atelet {name:15} {fmt_s(b.phases[name])}")
+            if name == INNER_PHASE.get(b.op) and inner:
+                for iname in sorted(inner.phases, key=phase_sort_key):
+                    if iname == TOTAL:
+                        continue
+                    writer(f"    ateom  {iname:13} {fmt_s(inner.phases[iname])}")
+                if TOTAL in inner.phases:
+                    gap = b.phases[name] - inner.phases[TOTAL]
+                    writer(f"    (gap)  {'rpc/queueing':13} {fmt_s(gap)}")
+
+
+def write_csv(dest: Path, name: str, rows: list[dict]) -> None:
+    if not rows:
+        return
+    dest.mkdir(parents=True, exist_ok=True)
+    path = dest / name
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("logs", nargs="+", help="JSON-lines log files ('-' for stdin)")
+    ap.add_argument("--csv", type=Path, default=None,
+                    help="also write phase_percentiles.csv here")
+    ap.add_argument("--slowest", type=int, default=3,
+                    help="number of slowest operations to print as waterfalls")
+    args = ap.parse_args()
+
+    parsed = parse_files(args.logs)
+    print(f"parsed {parsed.lines_matched} timing breakdown records "
+          f"out of {parsed.lines_seen} JSON log lines")
+    if not parsed.breakdowns:
+        print("no matching records; are these the atelet and worker pod logs?", file=sys.stderr)
+        return 1
+
+    print()
+    phase_rows = report_phases(parsed.breakdowns, print)
+    report_waterfalls(parsed.breakdowns, print, args.slowest)
+
+    if args.csv:
+        write_csv(args.csv, "phase_percentiles.csv", phase_rows)
+        print(f"\nCSV written to {args.csv}/")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
