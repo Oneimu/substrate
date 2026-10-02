@@ -234,9 +234,9 @@ func TestRoomCheckAllocatesNothingPerWorker(t *testing.T) {
 	}
 }
 
-// A memoized quantity is handed to every worker checked. Arithmetic on the
-// worker's copy must not reach back into the memo, or one worker's subtraction
-// would change what the next worker is compared against.
+// A memoized quantity is read for every worker checked. Arithmetic on the
+// worker's scratch must never write back into the memo, or one worker's
+// subtraction would change what the next worker is compared against.
 func TestRoomCheckMemoIsNotMutated(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -246,11 +246,11 @@ func TestRoomCheckMemoIsNotMutated(t *testing.T) {
 		{name: "int64 form", capacity: "3.5Gi", allocated: "1.5Gi"},
 		{
 			// Nine decimal places under a ten-digit byte count overflow an
-			// int64 at nano scale, so this stays an inf.Dec, shared by pointer
-			// between the memo and the scratch it is added into.
+			// int64 at nano scale, so both stay inf.Dec in the memo, and the
+			// scratch arithmetic reads them through a shared pointer.
 			name:      "inf.Dec form",
-			capacity:  "10.000000001Gi",
-			allocated: "7.000000001Gi",
+			capacity:  "12.000000001Gi",
+			allocated: "9.000000001Gi",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

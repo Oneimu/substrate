@@ -19,27 +19,21 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
-// RoomCheck asks one fixed question of many Workers in a row: does what a
-// Worker has left admit one more Actor of this size? Placement asks it of the
-// whole fleet on every call, so a RoomCheck parses the Actor's size once and
-// then reads each Worker's wire form in place, with no Quantities map per
-// Worker. It also memoizes every quantity string it has parsed: a fleet
-// reports a handful of distinct capacities and its allocation totals are sums
-// of a handful of template sizes, so past the first few Workers a check
-// parses nothing at all.
+// RoomCheck asks whether Workers have room for one more Actor of a fixed
+// size. Placement asks that of the whole fleet on every call, so a RoomCheck
+// parses the Actor's size once, reads each Worker's wire form without building
+// a Quantities map, and memoizes every quantity string it parses: a fleet has
+// few distinct ones, so past the first Workers a check parses nothing.
 //
-// A RoomCheck belongs to one goroutine. Its memo and scratch space are not
-// locked.
+// A RoomCheck belongs to one goroutine; nothing in it is locked.
 type RoomCheck struct {
-	// names and need are the Actor's size, one dimension per index. A linear
-	// scan over names beats a map for the two or three dimensions a size has.
+	// names and need are the Actor's size, one dimension per index. Sizes
+	// have two or three dimensions, so a scan over names beats a map.
 	names []string
 	need  []resource.Quantity
-	// free is scratch for one Worker's remaining capacity, index-aligned with
-	// names, reused across Workers so a check allocates nothing.
+	// free is scratch for one Worker's remaining capacity, aligned with names.
 	free []resource.Quantity
-	// parsed memoizes ParseQuantity by wire string, failures included, so a
-	// string seen on one Worker is never parsed again for another.
+	// parsed memoizes ParseQuantity by wire string, failures included.
 	parsed map[string]parsedQuantity
 }
 
@@ -55,6 +49,9 @@ func NewRoomCheck(want *ateapipb.Resources) (*RoomCheck, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(quantities) == 0 {
+		return &RoomCheck{}, nil // fits anywhere; Admits never reads the rest
+	}
 	c := &RoomCheck{
 		names:  make([]string, 0, len(quantities)),
 		need:   make([]resource.Quantity, 0, len(quantities)),
@@ -69,13 +66,11 @@ func NewRoomCheck(want *ateapipb.Resources) (*RoomCheck, error) {
 }
 
 // Admits reports whether capacity less allocated covers the Actor's size in
-// every dimension the size names, with the semantics of ParseQuantities, Sub,
-// and Covers: a repeated name sums, a dimension the Worker does not report is
-// none of it, and an overcommitted dimension covers nothing. An Actor asking
-// for nothing fits anywhere, whatever the Worker reports.
-//
-// A capacity or allocation entry that will not parse, wanted dimension or
-// not, means no room: the Worker's true occupancy is unreadable.
+// every dimension it names, as ParseQuantities, Sub, and Covers would answer:
+// a repeated name sums, a dimension the Worker does not report is none of it,
+// and an overcommitted dimension covers nothing. An Actor asking for nothing
+// fits anywhere. An entry that will not parse, in any dimension, means no
+// room: the Worker's true occupancy is unreadable.
 func (c *RoomCheck) Admits(capacity, allocated *ateapipb.Resources) bool {
 	if len(c.names) == 0 {
 		return true
@@ -126,22 +121,16 @@ func (c *RoomCheck) parse(s string) (resource.Quantity, bool) {
 	return p.quantity, p.ok
 }
 
-// int64Form returns q backed by a plain int64 amount when its value fits one at
-// whole, milli, micro, or nano scale. That is every quantity short of a
-// billion-fold spread between its magnitude and its precision, since
-// ParseQuantity rounds to nano scale; anything else is returned as is, still
-// correct, just slower to compare.
-//
-// ParseQuantity leaves a quantity with a fractional or long mantissa, "1.5Gi"
-// say, on its inf.Dec path, where every Add, Sub, and Cmp allocates big.Int
-// state, and where the pointer inside q would be shared between the memo and
-// every Worker checked against it. The int64 form is a value: arithmetic on a
-// copy allocates nothing and touches nothing shared.
+// int64Form returns q backed by a plain int64 at whole, milli, micro, or nano
+// scale when its value fits one, else q unchanged. ParseQuantity leaves values
+// such as "1.5Gi" on its inf.Dec path, where Add, Sub, and Cmp allocate big.Int
+// state and the Dec pointer would be shared from the memo; the int64 form is a
+// value, so arithmetic on a copy allocates nothing and shares nothing.
 func int64Form(q resource.Quantity) resource.Quantity {
 	for _, scale := range []resource.Scale{0, resource.Milli, resource.Micro, resource.Nano} {
-		// ScaledValue rounds up and silently overflows; comparing the result
-		// back against q accepts it only when it is exact. Cmp against an
-		// inf.Dec rewrites its receiver into one, hence the throwaway copy.
+		// ScaledValue rounds up and silently overflows, so accept the result
+		// only if it compares equal. Cmp against an inf.Dec rewrites its
+		// receiver into one, hence the throwaway copy.
 		candidate := *resource.NewScaledQuantity(q.ScaledValue(scale), scale)
 		if compared := candidate; compared.Cmp(q) == 0 {
 			return candidate
