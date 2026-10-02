@@ -92,6 +92,12 @@ atespace produce one record pair each.
 
 ## 3. Collect the node logs
 
+(A headless `runner.py` run does this step and the next one itself, and
+writes the percentiles into its `stats.jsonl`; see
+[benchmarking/analysis/README.md](../../benchmarking/analysis/README.md#automated-runs).
+The rest of this section is the by-hand path for a run driven from the web
+UI, as above.)
+
 Collect **while the pods still exist**. `benchmarking/automation/
 orchestrator.py` deletes the workload and ate-system pods right after each
 test and does not run this step yet, so on a cluster you manage yourself this
