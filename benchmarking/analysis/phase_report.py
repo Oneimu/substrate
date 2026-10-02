@@ -34,6 +34,9 @@ actor).
 Usage:
     phase_report.py run-logs/*.log [--csv DEST_DIR] [--slowest N]
 
+Feed it one source per run: the kubectl dumps, or the Cloud Logging export,
+not both, or every record counts twice.
+
 The records are developer-facing logs, not metric API; this reader is the
 consumer that makes them percentiles. See benchmarking/analysis/README.md.
 """
@@ -102,8 +105,10 @@ INNER_PHASE = {"restore": "ateom_restore", "checkpoint": "ateom_checkpoint"}
 # paused window costs their max, not their sum.
 CONCURRENT_CAPTURES = ("snapshot", "durable_dir", "rootfs_upper")
 
-# Slack when matching the ateom record to the atelet record of the same
-# operation: the ateom one is emitted a hair before the atelet one.
+# Slack on the window in which the ateom record of an operation must land:
+# atelet does a little work after the ateom call returns before it writes its
+# own record (unmounting, resetting the actor dirs), and the two clocks are
+# the same node's but not the same goroutine's.
 JOIN_SLACK_S = 1.0
 
 
@@ -156,7 +161,9 @@ def unattributed(source: str, op: str, phases: dict[str, float]) -> float | None
     checkpoint is prep, pause, the concurrent captures (max), then teardown.
     The atelet restore phases overlap by design (download runs alongside the
     asset fetch and OCI unpack) and the ateom restore phases partition their
-    total by construction, so neither gets a residual."""
+    total by construction, so neither gets a residual. The phases are
+    sub-intervals of the total, so a negative result is a bug in the emitter
+    or in this formula; it is not clamped, so that it shows."""
     total = phases.get(TOTAL)
     if total is None:
         return None
@@ -168,7 +175,7 @@ def unattributed(source: str, op: str, phases: dict[str, float]) -> float | None
                  + phases.get("teardown", 0.0))
     else:
         return None
-    return max(total - spent, 0.0)
+    return total - spent
 
 
 def parse_line(obj: dict, out: Parsed) -> None:
@@ -192,14 +199,15 @@ def parse_line(obj: dict, out: Parsed) -> None:
                     out.bad_values += 1
             if not phases:
                 continue
+            time_s = obj.get("time", "")
             residual = unattributed(source, op, phases)
             if residual is not None:
                 phases[UNATTRIBUTED] = residual
             out.breakdowns.append(Breakdown(
                 source=source,
                 op=op,
-                time=obj.get("time", ""),
-                ts=parse_time(obj.get("time", "")),
+                time=time_s,
+                ts=parse_time(time_s),
                 actor_uid=obj.get(ACTOR_UID_KEY, ""),
                 template=obj.get(TEMPLATE_KEY, ""),
                 sandbox_class=obj.get(SANDBOX_CLASS_KEY, "")
@@ -224,8 +232,10 @@ def parse_files(paths: list[str]) -> Parsed:
             # across lines, so it cannot be read line by line.
             try:
                 entries = json.loads(text)
-            except json.JSONDecodeError:
-                entries = []
+            except json.JSONDecodeError as e:
+                print(f"warn: {path}: not a valid JSON array (truncated export?): {e}; skipped",
+                      file=sys.stderr)
+                continue
             for obj in entries:
                 if isinstance(obj, dict):
                     out.lines_seen += 1
@@ -301,40 +311,75 @@ def report_phases(breakdowns: list[Breakdown], writer) -> list[dict]:
     return rows
 
 
-def inner_record(op: Breakdown, by_actor: dict[tuple, list[Breakdown]]) -> Breakdown | None:
-    """The successful ateom record of the same actor and op inside op's own
-    window (its record time minus its total): one cycle emits exactly one of
-    each, and the ateom one lands first, inside the atelet ateom_* phase. An
-    older record belongs to an earlier cycle whose partner is missing (pod
-    gone, log rotated, window cut), and pairing it would print a gap that
-    never happened, so nothing is better than the wrong one."""
+def ateom_window(op: Breakdown) -> tuple[float, float] | None:
+    """When, relative to the atelet record's time, the ateom record of the
+    same operation was written. ateom writes it as its RPC returns, i.e. at
+    the end of the atelet ateom_* phase: for a checkpoint that is before
+    persist runs, for a restore it is the last phase. An operation that never
+    reached the ateom call has no window and nothing to pair with."""
     total = op.phases.get(TOTAL)
-    if op.ts is None or total is None:
+    if op.ts is None or total is None or INNER_PHASE[op.op] not in op.phases:
         return None
-    lo, hi = op.ts - total - JOIN_SLACK_S, op.ts + JOIN_SLACK_S
-    candidates = [a for a in by_actor.get((op.actor_uid, op.op), [])
-                  if not a.failed and a.ts is not None and lo <= a.ts <= hi]
-    return candidates[-1] if candidates else None
+    if op.op == "checkpoint":
+        return (op.ts - total - JOIN_SLACK_S,
+                op.ts - op.phases.get("persist", 0.0) + JOIN_SLACK_S)
+    return (op.ts - op.phases[INNER_PHASE[op.op]] - JOIN_SLACK_S, op.ts + JOIN_SLACK_S)
 
 
-def report_waterfalls(breakdowns: list[Breakdown], writer, slowest: int) -> None:
+def pair_records(breakdowns: list[Breakdown]) -> dict[int, Breakdown]:
+    """Match each atelet record to the ateom record of the same operation:
+    same actor and op, written inside the atelet ateom_* phase's window, and
+    not already claimed by another operation. Returns id(atelet) -> ateom.
+
+    One cycle emits exactly one of each. An ateom record outside the window
+    belongs to another cycle whose partner is missing (pod gone, log rotated,
+    window cut); claiming it would print a gap that never happened, so an
+    operation without a match prints without one. Matching in time order
+    with a consumed set keeps rapid cycles of one actor from sharing or
+    swapping records. A paired ateom record also inherits the snapshot kind
+    its layer does not log, so the two layers' percentiles split alike."""
+    by_actor: dict[tuple, list[Breakdown]] = defaultdict(list)
+    for b in breakdowns:
+        if b.source == "ateom" and b.ts is not None:
+            by_actor[(b.actor_uid, b.op)].append(b)
+    for v in by_actor.values():
+        v.sort(key=lambda b: b.ts)
+
+    pairs: dict[int, Breakdown] = {}
+    consumed: set[int] = set()
+    atelet = sorted((b for b in breakdowns if b.source == "atelet" and b.ts is not None),
+                    key=lambda b: b.ts)
+    for op in atelet:
+        window = ateom_window(op)
+        if window is None:
+            continue
+        lo, hi = window
+        candidates = [a for a in by_actor.get((op.actor_uid, op.op), [])
+                      if id(a) not in consumed and lo <= a.ts <= hi]
+        if not candidates:
+            continue
+        inner = candidates[-1]
+        consumed.add(id(inner))
+        pairs[id(op)] = inner
+        if not inner.kind:
+            inner.kind = op.kind
+    return pairs
+
+
+def report_waterfalls(breakdowns: list[Breakdown], writer, slowest: int,
+                      pairs: dict[int, Breakdown] | None = None) -> None:
     """The slowest operations: the ateom record nested under the atelet
     ateom_* phase, and the gap between that phase and the ateom total (RPC
     and queueing between the layers)."""
-    by_actor: dict[tuple, list[Breakdown]] = defaultdict(list)
-    for b in breakdowns:
-        if b.source == "ateom":
-            by_actor[(b.actor_uid, b.op)].append(b)
-    for v in by_actor.values():
-        v.sort(key=lambda b: (b.ts or 0.0, b.time))
-
+    if pairs is None:
+        pairs = pair_records(breakdowns)
     atelet = [b for b in breakdowns if b.source == "atelet" and not b.failed]
     atelet.sort(key=lambda b: b.phases.get(TOTAL, 0), reverse=True)
 
     writer("")
     writer(f"== Slowest {slowest} operations (waterfall, ms) ==")
     for b in atelet[:slowest]:
-        inner = inner_record(b, by_actor)
+        inner = pairs.get(id(b))
         total = b.phases.get(TOTAL, 0)
         writer(f"{b.op} actor={b.actor_uid} template={b.template} "
                f"class={b.sandbox_class or '-'} scope={b.scope or '-'} kind={b.kind or '-'} "
@@ -385,9 +430,12 @@ def main() -> int:
         print("no matching records; are these the atelet and worker pod logs?", file=sys.stderr)
         return 1
 
+    # Pair before the percentiles: a paired ateom record takes its kind from
+    # the atelet record, so both layers' rows split the same way.
+    pairs = pair_records(parsed.breakdowns)
     print()
     phase_rows = report_phases(parsed.breakdowns, print)
-    report_waterfalls(parsed.breakdowns, print, args.slowest)
+    report_waterfalls(parsed.breakdowns, print, args.slowest, pairs)
 
     if args.csv:
         write_csv(args.csv, "phase_percentiles.csv", phase_rows)

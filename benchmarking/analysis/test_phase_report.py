@@ -17,6 +17,7 @@
     python3 -m unittest discover -s benchmarking/analysis
 """
 
+import contextlib
 import io
 import json
 import os
@@ -155,8 +156,9 @@ class ParseTest(unittest.TestCase):
     def test_cloud_logging_export_file_is_a_json_array(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "export.json")
+            second = dict(CLOUD_LOGGING_ENTRY, timestamp="2026-09-28T17:50:47.000000000Z")
             with open(path, "w") as f:
-                json.dump([CLOUD_LOGGING_ENTRY, CLOUD_LOGGING_ENTRY], f, indent=2)
+                json.dump([CLOUD_LOGGING_ENTRY, second], f, indent=2)
             out = phase_report.parse_files([path])
         self.assertEqual((out.lines_seen, len(out.breakdowns)), (2, 2))
 
@@ -172,6 +174,18 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(out.bad_values, 2)
         self.assertEqual(out.breakdowns[0].phases["total"], 3.9)
         self.assertNotIn("download", out.breakdowns[0].phases)
+
+    def test_malformed_export_warns_instead_of_vanishing(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "export.json")
+            with open(path, "w") as f:
+                f.write('[{"jsonPayload": {"msg": "Checkpoint timing breakdown"')  # truncated
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                out = phase_report.parse_files([path])
+        self.assertEqual(out.breakdowns, [])
+        self.assertIn("export.json", err.getvalue())
+        self.assertIn("truncated export", err.getvalue())
 
     def test_prefixed_kubectl_lines_still_parse(self):
         with tempfile.TemporaryDirectory() as d:
@@ -199,9 +213,10 @@ class UnattributedTest(unittest.TestCase):
         for b in out.breakdowns:
             self.assertNotIn("unattributed", b.phases)
 
-    def test_residual_never_negative(self):
+    def test_negative_residual_is_not_clamped(self):
+        # Cannot happen on a well-formed record; if it does, it must show.
         rec = dict(ATELET_CHECKPOINT, **{"ate.actor.checkpoint.duration.total": 1.0})
-        self.assertEqual(parse(rec).breakdowns[0].phases["unattributed"], 0.0)
+        self.assertAlmostEqual(parse(rec).breakdowns[0].phases["unattributed"], 1.0 - (0.01 + 1.14 + 4.48))
 
 
 class ReportTest(unittest.TestCase):
@@ -214,13 +229,40 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(downloads[0]["count"], 1)  # the failed 30s never entered
 
     def test_percentiles_split_by_sandbox_class_and_kind(self):
-        golden = dict(ATELET_RESTORE, **{"ate.snapshot.kind": "golden", "ate.sandbox.class": "gvisor",
+        golden = dict(ATELET_RESTORE, **{"time": "2026-09-23T09:59:00.000000000Z",
+                                         "ate.snapshot.kind": "golden", "ate.sandbox.class": "gvisor",
                                          "ate.actor.restore.duration.download": 9.0,
                                          "ate.actor.restore.duration.total": 10.0})
         latest = dict(ATELET_RESTORE, **{"ate.sandbox.class": "gvisor"})
         rows = phase_report.report_phases(parse(golden, latest).breakdowns, lambda _: None)
         downloads = {(r["class"], r["kind"]): r["p50_ms"] for r in rows if r["phase"] == "download"}
         self.assertEqual(downloads, {("gvisor", "golden"): 9000.0, ("gvisor", "latest"): 2400.0})
+
+    def test_paired_ateom_record_inherits_the_atelet_kind(self):
+        out = parse(ATEOM_RESTORE, ATELET_RESTORE)
+        pairs = phase_report.pair_records(out.breakdowns)
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(out.breakdowns[0].kind, "latest")
+        rows = phase_report.report_phases(out.breakdowns, lambda _: None)
+        self.assertEqual({r["kind"] for r in rows if r["layer"] == "ateom"}, {"latest"})
+
+    def test_checkpoint_pairing_window_ends_where_persist_starts(self):
+        # The ateom record is written when ateom_checkpoint ends, before the
+        # 4.48 s persist; a record from inside the persist window belongs to
+        # a later cycle of a rapidly cycling actor.
+        during_persist = dict(ATEOM_CHECKPOINT, time="2026-09-23T10:00:59.000000000Z")
+        out = parse(ATEOM_CHECKPOINT, during_persist, ATELET_CHECKPOINT)
+        pairs = phase_report.pair_records(out.breakdowns)
+        atelet = next(b for b in out.breakdowns if b.source == "atelet")
+        self.assertIs(pairs[id(atelet)], out.breakdowns[0])
+
+    def test_an_ateom_record_pairs_with_at_most_one_operation(self):
+        second = dict(ATELET_RESTORE, time="2026-09-23T10:00:05.900000000Z")
+        out = parse(ATEOM_RESTORE, ATELET_RESTORE, second)
+        pairs = phase_report.pair_records(out.breakdowns)
+        self.assertEqual(len(pairs), 1)
+        first = next(b for b in out.breakdowns if b.source == "atelet")
+        self.assertIn(id(first), pairs)
 
     def test_waterfall_ignores_an_ateom_record_from_another_cycle(self):
         out = parse(ATEOM_RESTORE_STALE, ATELET_RESTORE)

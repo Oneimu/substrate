@@ -21,8 +21,9 @@ the report.
 * A cluster with Agent Substrate installed from a tree that has the records
   and the analysis tools: the
   [Quickstart (Development)](../../README.md#quickstart-development) for kind,
-  or the [GKE Quickstart](../../README.md#gke-quickstart-development). For GKE,
-  `source .ate-dev-env.sh` first; every script below reads it.
+  or the [GKE Quickstart](../../README.md#gke-quickstart-development). For GKE
+  the scripts below read `.ate-dev-env.sh` from the repository root
+  (`collect_logs.sh` sources it itself; set `NO_DEV_ENV` to opt out).
 * The **microVM** sandbox class, if you want the inner (ateom) phases: see
   [microvm-local.md](microvm-local.md). ateom-gvisor writes no breakdown
   record, so on a gVisor pool the report shows the atelet layer only.
@@ -103,7 +104,8 @@ is the moment to do it:
 `--since-time` (or a relative `--since 30m`) should cover the run and nothing
 before it. The script writes one file per atelet pod (`ate-system`) and per
 worker pod (`benchmark-workloads`) under `--dest`; a pod it cannot read is
-skipped with a warning. `kubectl logs` returns only a container's current log
+skipped with a warning. Use either these dumps or the Cloud Logging export
+below for a run, not both. `kubectl logs` returns only a container's current log
 file, so collect soon after the run, before kubelet rotates it.
 
 On GKE the same records are also in Cloud Logging, where they outlive both
@@ -159,6 +161,7 @@ phases scale with dirty memory.
   a restarted container's previous log as `<pod>.previous.log`). On GKE the
   Cloud Logging export has everything.
 * **A record has `error.type`.** That operation failed; the report leaves it
-  out of the percentiles but the waterfall input still lists it. A
-  `DeadlineExceeded` on `download` or `persist` with a normal-looking
-  `ateom_*` phase points at object storage, not the runtime.
+  out of the percentiles and the waterfalls. To see where it died, grep the
+  record itself: a `DeadlineExceeded` whose time sits in `download` or
+  `persist` with a normal-looking `ateom_*` phase points at object storage,
+  not the runtime.

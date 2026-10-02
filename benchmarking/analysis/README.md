@@ -35,27 +35,39 @@ A failed atelet operation still writes its record, marked with `error.type`
    ./collect_logs.sh --dest /tmp/run1 --since-time 2026-09-24T18:00:00Z
    ```
 
-   `--since-time` (or a relative `--since 30m`) should cover the run and
-   nothing before it. `--namespace` (default `ate-system`) selects the atelet
-   pods and `--worker-namespace` (default `benchmark-workloads`) the worker
-   pods; the ateom records land in the worker pod's stdout. `kubectl logs`
+   The script sources `.ate-dev-env.sh` from the repository root when present
+   (set `NO_DEV_ENV` to skip) and honors `KUBECTL_CONTEXT`, like the `hack/`
+   scripts. `--since-time` (or a relative `--since 30m`) should cover the run
+   and nothing before it. `--namespace` (default `ate-system`) selects the
+   atelet pods and `--worker-namespace` (default `benchmark-workloads`) the
+   worker pods; the ateom records land in the worker pod's stdout. `kubectl logs`
    returns only a container's current log file, so on a long or busy run
    kubelet's rotation can drop earlier records — collect soon after the run.
    A container that restarted mid-run is dumped twice (`<pod>.previous.log`).
 
    On GKE the same records are in Cloud Logging, which keeps them past
-   rotation and teardown; an export is accepted as input directly:
+   rotation and teardown; an export is accepted as input directly, instead of
+   the kubectl dumps:
 
    ```bash
    gcloud logging read '(jsonPayload.msg="Checkpoint timing breakdown" OR jsonPayload.msg="Restore timing breakdown") AND resource.labels.cluster_name="<cluster>" AND timestamp>="2026-09-24T18:00:00Z"' \
      --project <project> --format json > /tmp/run1/export.json
    ```
 
-3. Aggregate (kubectl dumps and Cloud Logging exports can be mixed):
+3. Aggregate, from the kubectl dumps:
 
    ```bash
    python3 phase_report.py /tmp/run1/*.log --csv /tmp/run1/report
    ```
+
+   or from the Cloud Logging export:
+
+   ```bash
+   python3 phase_report.py /tmp/run1/export.json --csv /tmp/run1/report
+   ```
+
+   Use one source per run: the dumps and an export of the same pods hold the
+   same records, and passing both would count each twice.
 
 ## Reading the report
 
@@ -76,14 +88,19 @@ ateom checkpoint captures run concurrently on the paused guest (the paused
 window costs their max), and the ateom restore phases are sequential. For
 the two checkpoint layers the report derives an `unattributed` row: the total
 minus what the logged phases account for, counting the concurrent captures
-once. It is the time the instrumentation does not yet name.
+once. It is the time the instrumentation does not yet name. The ateom
+records carry no snapshot kind of their own; a paired one takes its kind from
+the atelet record, so both layers split into the same rows.
 
 **Waterfalls.** The slowest operations, with the ateom record of the same
-actor and time window nested under the atelet `ateom_*` phase and that
-phase's gap to the ateom total (RPC and queueing between the layers). An
-operation whose ateom record is missing prints without one rather than with
-another cycle's. Tail outliers that blow up in one phase every
-time are systematic; different phases each time are environmental.
+actor nested under the atelet `ateom_*` phase and that phase's gap to the
+ateom total (RPC and queueing between the layers). The ateom record is the
+one written inside that phase's window (for a checkpoint, before `persist`
+began), and each ateom record pairs with at most one operation, so an
+operation whose own record is missing prints without one rather than with
+another cycle's. Failed operations (`error.type` set) are left out of both
+the percentiles and the waterfalls. Tail outliers that blow up in one phase
+every time are systematic; different phases each time are environmental.
 
 `--csv` also writes `phase_percentiles.csv` for run-over-run comparison.
 

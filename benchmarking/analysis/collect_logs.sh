@@ -26,10 +26,21 @@
 # rotation and teardown; phase_report.py reads `gcloud logging read
 # --format json` output directly.
 #
+# Like the other hack scripts, this sources .ate-dev-env.sh from the repo root
+# for the cluster settings unless NO_DEV_ENV is set, and respects
+# KUBECTL_CONTEXT.
+#
 # Usage: collect_logs.sh --dest DIR [--since 30m | --since-time 2026-09-24T18:00:00Z]
 #                        [--namespace ate-system] [--worker-namespace benchmark-workloads]
 
 set -uo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+if [[ -r "${ROOT}/.ate-dev-env.sh" ]] && [[ -z "${NO_DEV_ENV:-}" ]]; then
+  # shellcheck source=/dev/null
+  source "${ROOT}/.ate-dev-env.sh"
+fi
+run_kubectl() { kubectl ${KUBECTL_CONTEXT:+--context=${KUBECTL_CONTEXT}} "$@"; }
 
 DEST=""
 SINCE="1h"
@@ -65,23 +76,23 @@ fi
 collect() {
   local ns="$1" selector="$2"
   local pods
-  if ! pods=$(kubectl get pods -n "${ns}" -l "${selector}" -o name); then
+  if ! pods=$(run_kubectl get pods -n "${ns}" -l "${selector}" -o name); then
     echo "warn: could not list pods in ${ns} (${selector}); skipping" >&2
     return 0
   fi
   for pod in ${pods}; do
     local name="${pod#pod/}"
     echo "collecting ${ns}/${name} (${WINDOW[*]})"
-    kubectl logs -n "${ns}" "${name}" "${WINDOW[@]}" --timestamps=false \
+    run_kubectl logs -n "${ns}" "${name}" "${WINDOW[@]}" --timestamps=false \
       > "${DEST}/${ns}-${name}.log" \
       || { echo "warn: kubectl logs ${ns}/${name} failed; skipping" >&2; rm -f "${DEST}/${ns}-${name}.log"; }
     # --previous is only valid after a restart; kubectl rejects it otherwise.
     local restarts
-    restarts=$(kubectl get pod -n "${ns}" "${name}" \
+    restarts=$(run_kubectl get pod -n "${ns}" "${name}" \
       -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo 0)
     if [[ "${restarts:-0}" -gt 0 ]]; then
       echo "collecting ${ns}/${name} previous container (${restarts} restarts)"
-      kubectl logs -n "${ns}" "${name}" --previous "${WINDOW[@]}" --timestamps=false \
+      run_kubectl logs -n "${ns}" "${name}" --previous "${WINDOW[@]}" --timestamps=false \
         > "${DEST}/${ns}-${name}.previous.log" \
         || { echo "warn: kubectl logs --previous ${ns}/${name} failed; skipping" >&2; rm -f "${DEST}/${ns}-${name}.previous.log"; }
     fi
