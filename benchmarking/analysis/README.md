@@ -107,6 +107,25 @@ every time are systematic; different phases each time are environmental.
 The parser is deliberately tolerant: it scans any line for a JSON object and
 matches on `msg`, so raw `kubectl logs` dumps (even with prefixes) work.
 
+## Automated runs
+
+The locust runner (`benchmarking/locust/runner.py`) does the collection
+itself at the end of a headless run: `phase_breakdown.py` reads the atelet
+and worker pod logs through the Kubernetes API while the pods still exist
+(the orchestrator deletes them as soon as the runner exits) and appends the
+percentiles to the run's `stats.jsonl`, one row per layer / operation /
+class / kind / scope / phase (`metric: phase_<layer>_<op>_<class>_<kind>_<scope>_<phase>`;
+the measurements map carries those dimensions as fields next to `count`,
+`p50_ms`, `p90_ms`, `p95_ms`, `max_ms`, all as strings like the runner's
+other rows). A `phase_breakdown_summary` row is always written: pods read
+and failed, the record count, and the atelet record counts next to locust's
+`SuspendActor` / `ResumeActor` request counts. More records than requests is
+normal (boomer suspends its actors on shutdown); fewer means a node log was
+rotated during the run, and the runner's log says so. `--no-phase-breakdown`
+skips it. The runner's service account needs `list` on `pods` and `get` on
+`pods/log` in `ate-system` and `benchmark-workloads`
+(`automation/manifests/runner-job.yaml.tmpl`).
+
 ## Tests
 
 ```bash

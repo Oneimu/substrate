@@ -49,6 +49,7 @@ from cluster_facts import (
     get_cluster_hardware_facts,
 )
 from common.boomer_config import build_config_json
+from phase_breakdown import append_phase_breakdown
 
 # Path inside the locust image to the boomer-worker binary baked in by
 # benchmarking/locust/Dockerfile.
@@ -121,6 +122,17 @@ def parse_args() -> argparse.Namespace:
             "Read node capacity and worker pod count from the Kubernetes API "
             "after the run to derive density frontiers. Pass "
             "--no-cluster-facts to skip Kubernetes API discovery"
+        ),
+    )
+    p.add_argument(
+        "--phase-breakdown",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Read the atelet and worker pod logs after the run and append the "
+            "suspend/resume phase percentiles to stats.jsonl (see "
+            "benchmarking/analysis/README.md). Pass --no-phase-breakdown to "
+            "skip reading pod logs"
         ),
     )
     args, extra = p.parse_known_args()
@@ -511,6 +523,26 @@ def main() -> None:
                 )
             except Exception as e:
                 tee(logs, f"Warning: Failed to record cluster facts: {e}")
+
+        # The phase breakdown is additive too. It reads the node logs now,
+        # while the pods still exist: the orchestrator deletes them as soon
+        # as this process exits. The window reaches back to this run's start
+        # with a margin for the clocks involved.
+        if stats_generated and args.phase_breakdown:
+            try:
+                append_phase_breakdown(
+                    jsonl_path,
+                    stats_csv,
+                    int(time.time() - now.timestamp()) + 60,
+                    data_ts,
+                    args.tag,
+                    args.name,
+                    logs,
+                )
+            except Exception as e:
+                tee(logs, f"Warning: Failed to record phase breakdown: {e}")
+        elif stats_generated:
+            tee(logs, "Skipping phase breakdown (--no-phase-breakdown)")
 
     status_path.write_text(
         json.dumps(

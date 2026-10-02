@@ -187,6 +187,12 @@ class ParseTest(unittest.TestCase):
         self.assertIn("export.json", err.getvalue())
         self.assertIn("truncated export", err.getvalue())
 
+    def test_parse_lines_feeds_an_existing_parse(self):
+        out = phase_report.parse_lines([json.dumps(ATELET_RESTORE), "not json", ""])
+        self.assertEqual((out.lines_seen, len(out.breakdowns)), (1, 1))
+        phase_report.parse_lines(["pod/x " + json.dumps(ATEOM_RESTORE)], out)
+        self.assertEqual(len(out.breakdowns), 2)
+
     def test_prefixed_kubectl_lines_still_parse(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "pod.log")
@@ -270,6 +276,19 @@ class ReportTest(unittest.TestCase):
         self.assertIn("atelet ateom_restore", text)
         self.assertNotIn("ateom  vm_restore", text)
         self.assertNotIn("(gap)", text)
+
+    def test_stats_rows_take_the_runner_jsonl_shape(self):
+        rows = phase_report.report_phases(parse(ATELET_RESTORE).breakdowns, lambda _: None)
+        entries = phase_report.stats_rows(rows, "2026-09-23T10:00:00Z", "abc123", "glutton_mem_1gi")
+        download = next(e for e in entries if e["metric"].endswith("_download"))
+        self.assertEqual(download["metric"], "phase_atelet_restore_none_latest_full_download")
+        self.assertEqual((download["timestamp"], download["tag"], download["test_name"]),
+                         ("2026-09-23T10:00:00Z", "abc123", "glutton_mem_1gi"))
+        # String values and the dimensions as fields, like the runner's rows.
+        self.assertEqual(download["measurements"], {
+            "layer": "atelet", "op": "restore", "class": "none", "kind": "latest",
+            "scope": "full", "phase": "download",
+            "count": "1", "p50_ms": "2400.0", "p90_ms": "2400.0", "p95_ms": "2400.0", "max_ms": "2400.0"})
 
     def test_waterfall_nests_ateom_and_gap_under_atelet(self):
         out = parse(ATEOM_RESTORE, ATELET_RESTORE)

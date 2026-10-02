@@ -50,6 +50,7 @@ import re
 import statistics
 import sys
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -221,6 +222,27 @@ def parse_line(obj: dict, out: Parsed) -> None:
             return
 
 
+def parse_lines(lines: Iterable[str], out: Parsed | None = None) -> Parsed:
+    """Parse one pod log, line by line, into out (a new Parsed by default).
+    This is also the entry point for a caller that already holds the log
+    text, such as the locust runner reading pods through the Kubernetes API."""
+    out = Parsed() if out is None else out
+    for line in lines:
+        # kubectl log dumps may prefix each line (pod name, timestamp);
+        # recover the JSON object from the first brace.
+        brace = line.find("{")
+        if brace < 0:
+            continue
+        out.lines_seen += 1
+        try:
+            obj = json.loads(line[brace:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            parse_line(obj, out)
+    return out
+
+
 def parse_files(paths: list[str]) -> Parsed:
     out = Parsed()
     for path in paths:
@@ -241,19 +263,7 @@ def parse_files(paths: list[str]) -> Parsed:
                     out.lines_seen += 1
                     parse_line(obj, out)
             continue
-        for line in text.splitlines():
-            # kubectl log dumps may prefix each line (pod name, timestamp);
-            # recover the JSON object from the first brace.
-            brace = line.find("{")
-            if brace < 0:
-                continue
-            out.lines_seen += 1
-            try:
-                obj = json.loads(line[brace:])
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict):
-                parse_line(obj, out)
+        parse_lines(text.splitlines(), out)
     return out
 
 
@@ -396,6 +406,30 @@ def report_waterfalls(breakdowns: list[Breakdown], writer, slowest: int,
                 if TOTAL in inner.phases:
                     gap = b.phases[name] - inner.phases[TOTAL]
                     writer(f"    (gap)  {'rpc/queueing':13} {fmt_s(gap)}")
+
+
+def stats_rows(rows: list[dict], timestamp: str, tag: str, test_name: str) -> list[dict]:
+    """report_phases() rows in the shape of the benchmark runner's stats.jsonl
+    (benchmarking/locust/runner.py): one object per metric with the run's
+    timestamp, tag and test name, and a flat, string-valued measurements map,
+    as the runner's other writers emit. The metric name carries the row's
+    dimensions so a dashboard can select a phase the way it selects a locust
+    request type; the dimensions are also fields of the map, since phase
+    names contain underscores and the name cannot be split back apart."""
+    out = []
+    for r in rows:
+        dims = {k: (r[k] if r[k] and r[k] != "-" else "none")
+                for k in ("layer", "op", "class", "kind", "scope", "phase")}
+        metric = "_".join(("phase", *dims.values()))
+        measurements = {**dims, **{k: r[k] for k in ("count", "p50_ms", "p90_ms", "p95_ms", "max_ms")}}
+        out.append({
+            "timestamp": timestamp,
+            "tag": tag,
+            "test_name": test_name,
+            "metric": re.sub(r"[^a-z0-9_]+", "_", metric.lower()),
+            "measurements": {k: str(v) for k, v in measurements.items()},
+        })
+    return out
 
 
 def write_csv(dest: Path, name: str, rows: list[dict]) -> None:
