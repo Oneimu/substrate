@@ -21,12 +21,12 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
+	"github.com/agent-substrate/substrate/internal/apierror"
 	"github.com/agent-substrate/substrate/internal/installdefaults"
 	"github.com/agent-substrate/substrate/internal/objectstore/objectstoretest"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -112,8 +112,8 @@ func TestSuspendActorWorkflow_RejectedAndIdempotentPaths(t *testing.T) {
 
 			actor, err := w.SuspendActor(ctx, resources.ActorRef{Atespace: "team-a", Name: "id1"})
 			if tc.wantErr {
-				if got := status.Code(err); got != codes.FailedPrecondition {
-					t.Fatalf("status.Code(err) = %v, want %v (err: %v)", got, codes.FailedPrecondition, err)
+				if got := apierror.Code(err); got != codes.FailedPrecondition {
+					t.Fatalf("apierror.Code(err) = %v, want %v (err: %v)", got, codes.FailedPrecondition, err)
 				}
 			} else {
 				if err != nil {
@@ -484,7 +484,7 @@ func TestEnsureSuspendedFinalized_KeepsReplacedSnapshotOnConflict(t *testing.T) 
 	})
 
 	w := &ActorWorkflow{store: &conflictingUpdateStore{Interface: persistence}, objectStore: objects}
-	if _, err := w.ensureSuspendedFinalized(ctx, actorRef, template); status.Code(err) != codes.Aborted {
+	if _, err := w.ensureSuspendedFinalized(ctx, actorRef, template); apierror.Code(err) != codes.Aborted {
 		t.Fatalf("ensureSuspendedFinalized = %v, want code Aborted", err)
 	}
 	if len(objects.Snapshot(t, previous)) == 0 {
@@ -581,9 +581,9 @@ func TestEnsureSuspendedFinalized_ReleasesOnlyOwnWorker(t *testing.T) {
 	}
 }
 
-// TestCommitSnapshotScope verifies golden actors always commit Full — the
-// golden snapshot is the base an OnGolden data resume combines into, so the
-// template's onCommit must not thin it down to a data-only capture.
+// TestCommitSnapshotScope verifies golden actors always commit Full — new
+// actors resume the golden snapshot Full, so the template's onCommit must not
+// thin it down to a data-only capture.
 func TestCommitSnapshotScope(t *testing.T) {
 	tmpl := func(onCommit ateapipb.SnapshotContentScope) *ateapipb.ActorTemplate {
 		return &ateapipb.ActorTemplate{
@@ -683,7 +683,7 @@ func TestEnsureMarkedSuspending_PausedScopeRejection(t *testing.T) {
 				t.Fatalf("ensureMarkedSuspending = %v, wantErr %t", err, tc.wantErr)
 			}
 			if tc.wantErr {
-				if got := status.Code(err); got != codes.FailedPrecondition {
+				if got := apierror.Code(err); got != codes.FailedPrecondition {
 					t.Errorf("status.Code = %v, want FailedPrecondition", got)
 				}
 			}

@@ -81,8 +81,8 @@ type scheduler struct {
 // Option configures the Scheduler returned by New.
 type Option func(*scheduler)
 
-// WithIntn overrides the random source used to pick among equally suitable
-// workers. n is always >= 1.
+// WithIntn overrides the random source used to sample candidate pairs: when
+// n >= 2 candidates exist, Schedule calls intn(n) and then intn(n-1).
 func WithIntn(intn func(n int) int) Option {
 	return func(s *scheduler) { s.intn = intn }
 }
@@ -96,7 +96,10 @@ func New(source WorkerSource, opts ...Option) Scheduler {
 	return s
 }
 
-// Schedule filters the current worker fleet to find unassigned candidates matching the given constraints.
+// Schedule filters the fleet for eligible candidates with room, samples two at
+// random (power of two choices), and returns the less-loaded one, where load is
+// the higher of actor-slot and compute-resource utilization. Spreading across
+// the warm pool avoids hotspots until autoscaling reclaims idle workers.
 func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ateapipb.Worker, error) {
 	workers, err := s.source.Workers()
 	if err != nil {
@@ -107,21 +110,109 @@ func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ate
 	// per worker, and remembers every worker quantity string it has read.
 	check, err := resources.NewRoomCheck(constraints.Limits)
 	if err != nil {
-		return nil, fmt.Errorf("while reading the actor's resource limits: %w", err)
+		return nil, fmt.Errorf("while parsing actor resource limits: %w", err)
 	}
 
-	var candidates []*ateapipb.Worker
+	var candidates []candidate
 	for _, worker := range workers {
-		if s.Applies(worker, constraints) && hasRoomWithCheck(worker, check) {
-			candidates = append(candidates, worker)
+		if !s.Applies(worker, constraints) {
+			continue
+		}
+		if hasRoomWithCheck(worker, check) {
+			candidates = append(candidates, candidate{worker: worker, resUtil: -1})
 		}
 	}
 
 	if len(candidates) == 0 {
 		return nil, ErrNoCapacity
 	}
+	if len(candidates) == 1 {
+		return candidates[0].worker, nil
+	}
 
-	return candidates[s.intn(len(candidates))], nil
+	i := s.intn(len(candidates))
+	j := s.intn(len(candidates) - 1)
+	if j >= i {
+		j++
+	}
+	if lessLoaded(&candidates[j], &candidates[i]) {
+		return candidates[j].worker, nil
+	}
+	return candidates[i].worker, nil
+}
+
+// candidate pairs an eligible worker with its cached compute utilization.
+type candidate struct {
+	worker *ateapipb.Worker
+	// resUtil is the worker's dominant compute-resource utilization in [0,1],
+	// or -1 if not yet computed. Only the two sampled candidates ever need it,
+	// so it is computed on demand rather than for every worker in the fleet.
+	resUtil float64
+}
+
+func (c *candidate) resourceUtilization() float64 {
+	if c.resUtil < 0 {
+		c.resUtil = workerResourceUtilization(c.worker)
+	}
+	return c.resUtil
+}
+
+// lessLoaded compares dominant utilization — the higher of actor-slot
+// utilization (allocated/capacity) and compute-resource utilization — so either
+// dimension can mark a worker as hot. Ties fall back to actor-slot utilization,
+// then to remaining actor slots.
+func lessLoaded(a, b *candidate) bool {
+	aAlloc := int64(a.worker.GetStatus().GetAllocated().GetActors())
+	bAlloc := int64(b.worker.GetStatus().GetAllocated().GetActors())
+	// hasRoomWithCheck admits only workers with allocated < capacity, so capacity >= 1.
+	aCap := int64(a.worker.GetStatus().GetCapacity().GetActors())
+	bCap := int64(b.worker.GetStatus().GetCapacity().GetActors())
+
+	aLoad := max(float64(aAlloc)/float64(aCap), a.resourceUtilization())
+	bLoad := max(float64(bAlloc)/float64(bCap), b.resourceUtilization())
+	if aLoad != bLoad {
+		return aLoad < bLoad
+	}
+
+	// Compare slot utilization exactly via cross-multiplication.
+	if lhs, rhs := aAlloc*bCap, bAlloc*aCap; lhs != rhs {
+		return lhs < rhs
+	}
+
+	return aCap-aAlloc > bCap-bAlloc
+}
+
+// workerResourceUtilization returns the highest allocated/capacity ratio across
+// compute dimensions, or 1 when capacity is unreported or quantities fail to parse.
+func workerResourceUtilization(w *ateapipb.Worker) float64 {
+	capQ, err := resources.ParseQuantities(w.GetStatus().GetCapacity().GetResources())
+	if err != nil || len(capQ) == 0 {
+		return 1
+	}
+	usedQ, err := resources.ParseQuantities(w.GetStatus().GetAllocated().GetResources())
+	if err != nil {
+		return 1
+	}
+	return quantitiesUtilization(capQ, usedQ)
+}
+
+func quantitiesUtilization(capQ, usedQ resources.Quantities) float64 {
+	var (
+		maxRatio    float64
+		hasPositive bool
+	)
+	for name, capVal := range capQ {
+		if capFloat := capVal.AsApproximateFloat64(); capFloat > 0 {
+			hasPositive = true
+			if usedVal, ok := usedQ[name]; ok {
+				maxRatio = max(maxRatio, usedVal.AsApproximateFloat64()/capFloat)
+			}
+		}
+	}
+	if !hasPositive {
+		return 1
+	}
+	return maxRatio
 }
 
 func (s *scheduler) Applies(worker *ateapipb.Worker, constraints Constraints) bool {
