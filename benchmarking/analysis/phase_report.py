@@ -233,14 +233,18 @@ def parse_files(paths: list[str]) -> Parsed:
             try:
                 entries = json.loads(text)
             except json.JSONDecodeError as e:
-                print(f"warn: {path}: not a valid JSON array (truncated export?): {e}; skipped",
-                      file=sys.stderr)
-                continue
-            for obj in entries:
-                if isinstance(obj, dict):
-                    out.lines_seen += 1
-                    parse_line(obj, out)
-            continue
+                # Not an export after all: a dump whose lines carry a bracket
+                # prefix, or a truncated export. Say so, then read it line by
+                # line like any other dump rather than drop the whole file.
+                print(f"warn: {path}: starts with '[' but is not a JSON array ({e}); "
+                      f"reading it line by line", file=sys.stderr)
+            else:
+                if isinstance(entries, list):
+                    for obj in entries:
+                        if isinstance(obj, dict):
+                            out.lines_seen += 1
+                            parse_line(obj, out)
+                    continue
         for line in text.splitlines():
             # kubectl log dumps may prefix each line (pod name, timestamp);
             # recover the JSON object from the first brace.

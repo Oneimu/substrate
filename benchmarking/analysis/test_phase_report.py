@@ -185,7 +185,21 @@ class ParseTest(unittest.TestCase):
                 out = phase_report.parse_files([path])
         self.assertEqual(out.breakdowns, [])
         self.assertIn("export.json", err.getvalue())
-        self.assertIn("truncated export", err.getvalue())
+        self.assertIn("not a JSON array", err.getvalue())
+
+    def test_bracket_prefixed_dump_is_read_line_by_line(self):
+        # A dump whose lines start with "[INFO]" also starts with "[", but
+        # it is not an export; its records must not be lost.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pod.log")
+            with open(path, "w") as f:
+                f.write("[INFO] " + json.dumps(ATELET_RESTORE) + "\n"
+                        "[2026-09-23 10:00:05] " + json.dumps(ATEOM_RESTORE) + "\n")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                out = phase_report.parse_files([path])
+        self.assertEqual(len(out.breakdowns), 2)
+        self.assertIn("reading it line by line", err.getvalue())
 
     def test_prefixed_kubectl_lines_still_parse(self):
         with tempfile.TemporaryDirectory() as d:
