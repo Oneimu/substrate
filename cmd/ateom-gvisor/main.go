@@ -68,6 +68,7 @@ var (
 
 	readinessListenAddress = pflag.String("readiness-listen-address", "0.0.0.0:8080", "Address for HTTP readiness checks")
 	maxActors              = pflag.Int("max-actors", 1000, "How many actors this worker will host at once")
+	usageSampleInterval    = pflag.Duration("usage-sample-interval", time.Minute, "How often the ateom samples the resource usage of its actors. Each sample writes an ate.actor.usage_sampled record per actor, and GetActiveWorkloadStats serves the latest.")
 
 	showVersion  = pflag.Bool("version", false, "Print version and exit.")
 	logLevelFlag = pflag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
@@ -78,6 +79,10 @@ var (
 	// reaper collects children orphaned in the pod PID namespace.
 	reaper = childreap.New()
 )
+
+// minUsageSampleInterval is the floor of --usage-sample-interval, the same as
+// atelet's poll interval floor.
+const minUsageSampleInterval = 50 * time.Second
 
 // workloadGracePeriod is the whole budget for draining the worker on shutdown.
 // It needs to stay significantly less than the K8s termination grace period
@@ -116,6 +121,9 @@ func do(ctx context.Context) error {
 	slog.InfoContext(ctx, "ateom booting", slog.String("version", version.Version))
 	if *maxActors < 0 {
 		return fmt.Errorf("--max-actors must not be negative, got %d", *maxActors)
+	}
+	if *usageSampleInterval < minUsageSampleInterval {
+		return fmt.Errorf("--usage-sample-interval must be at least %v, got %v", minUsageSampleInterval, *usageSampleInterval)
 	}
 
 	const serviceName = "ateom-gvisor"
@@ -212,6 +220,15 @@ func do(ctx context.Context) error {
 		return err
 	}
 	ateomService := NewService(tunnel, actorLogger, *maxActors)
+	// The controller sets both from the downward API.
+	pool := ateomstats.Pool{Namespace: os.Getenv("POD_NAMESPACE"), Name: os.Getenv("WORKER_POOL_NAME")}
+	if pool.Namespace == "" || pool.Name == "" {
+		slog.WarnContext(ctx, "Worker pool unknown; usage records will name no pool", slog.Any("pool", pool))
+	}
+	usageStdout := ateomstats.NewStdoutHandler(syncedWriter)
+	defer usageStdout.Close()
+	ateomService.usage = ateomstats.NewUsageEmitter(lp, usageStdout, pool)
+	defer ateomstats.StartSampler(ctx, *usageSampleInterval, func(ctx context.Context) { ateomService.sweepUsage(ctx) })()
 
 	svr := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
@@ -297,6 +314,8 @@ type AteomService struct {
 
 	actorLogger *actorlog.ActorLogger
 	tunnel      *ateomtunnel.Tunnel
+	// usage writes the usage records. Nil writes none.
+	usage *ateomstats.UsageEmitter
 
 	// shuttingDown is set once SIGTERM has been received. While true, new
 	// workload RPCs are rejected with codes.Unavailable.
@@ -386,6 +405,13 @@ func (s *AteomService) gracefulShutdown(ctx context.Context) {
 		return
 	}
 
+	// The kill below ends every activation still hosted. Read each while its
+	// sandbox runs, and write its final record once the containers are gone.
+	hosted := s.hostedActors()
+	for _, h := range hosted {
+		s.readFinal(ctx, h)
+	}
+
 	var wg sync.WaitGroup
 	for _, session := range sessions {
 		for _, name := range session.containers {
@@ -399,6 +425,9 @@ func (s *AteomService) gracefulShutdown(ctx context.Context) {
 		}
 	}
 	wg.Wait()
+	for _, h := range hosted {
+		s.recordFinal(ctx, h)
+	}
 
 	slog.InfoContext(ctx, "Shutting down")
 }
@@ -555,7 +584,8 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 		return nil, err
 	}
 	// Publish attribution before boot so stats can include startup usage.
-	if _, err := s.hostActor(ctx, attribution, req.GetActorDirs()); err != nil {
+	hosted, err := s.hostActor(ctx, attribution, req.GetActorDirs())
+	if err != nil {
 		return nil, err
 	}
 	rcmd := &runsc{
@@ -633,6 +663,7 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor started", attribution)
 	s.setSession(req.GetActorUid(), &workloadSession{rcmd: rcmd, containers: containerNames(req.GetSpec().GetContainers())})
+	s.recordInitial(ctx, hosted)
 
 	return &ateompb.RunWorkloadResponse{}, nil
 }
@@ -675,6 +706,12 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	}
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor checkpointing", attribution)
+	// Read before the snapshot: a Full checkpoint stops the sandbox, and its
+	// cgroup with it. The final record waits for the teardown.
+	hosted := s.lookupActor(req.GetActorUid())
+	if hosted != nil {
+		s.readFinal(ctx, hosted)
+	}
 
 	// Contract with atelet:
 	//
@@ -755,6 +792,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 			slog.Any("err", err))
 	}
 	timing.teardown = lap(&tLast)
+	s.recordFinalIfEnded(ctx, hosted)
 
 	// Report exactly the files runsc wrote so atelet ships precisely this set
 	// (checkpoint.img plus any pages images), rather than a hardcoded list.
@@ -902,7 +940,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	if err != nil {
 		return nil, err
 	}
-	_, err = s.hostActor(ctx, attribution, req.GetActorDirs())
+	hosted, err := s.hostActor(ctx, attribution, req.GetActorDirs())
 	timing.netSetup = lap(&tLast)
 	if err != nil {
 		return nil, err
@@ -1035,6 +1073,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor restored", attribution)
 	s.setSession(req.GetActorUid(), &workloadSession{rcmd: rcmd, containers: containerNames(containers)})
+	s.recordInitial(ctx, hosted)
 
 	return &ateompb.RestoreWorkloadResponse{}, nil
 }
@@ -1053,7 +1092,13 @@ func (s *AteomService) TerminateWorkload(ctx context.Context, req *ateompb.Termi
 
 	attribution := ateomstats.ActorAttributionFromRequest(req)
 
-	if err := s.terminateWorkload(ctx, attribution.Ref, attribution.UID, req.GetRunscPath(), req.GetActorDirs(), req.GetSpec().GetContainers()); err != nil {
+	hosted := s.lookupActor(attribution.UID)
+	if hosted != nil {
+		s.readFinal(ctx, hosted)
+	}
+	err := s.terminateWorkload(ctx, attribution.Ref, attribution.UID, req.GetRunscPath(), req.GetActorDirs(), req.GetSpec().GetContainers())
+	s.recordFinalIfEnded(ctx, hosted)
+	if err != nil {
 		return nil, fmt.Errorf("failed to terminate workload: %w", err)
 	}
 

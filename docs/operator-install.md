@@ -167,10 +167,12 @@ benchmark:
   workerCount: 4
 ```
 
-## Every run records what it used
+## Install runs record what they used
 
-A `deploy` command writes the settings it resolved to a file, so a later run
-can reproduce it without anyone remembering what was typed:
+A `deploy` command that installs Substrate writes the settings it resolved to
+a file, so a later run can reproduce it without anyone remembering what was
+typed. `deploy demo` and `deploy benchmarks` write nothing: they deploy on top
+of the system with only their own settings.
 
 ```
 recorded this configuration in ~/.cache/ate-setup/installs/prod.yaml
@@ -240,6 +242,7 @@ kind: SubstrateInstall
 cluster:
   context: prod
   outcome: succeeded
+  substrateVersion: v0.4.1
   writtenAt: "2026-09-29T23:14:38Z"
   writtenBy: ate-setup v0.4.1
 atenet:
@@ -247,6 +250,10 @@ atenet:
 context: prod
 namespace: ate-prod
 ```
+
+`cluster.substrateVersion` is the Substrate release the run installed: the
+version stamped into the binaries it built, or the image tag of a prebuilt
+install. `cluster.writtenBy` is the `ate-setup` that wrote the file.
 
 Only settings something supplied are recorded. A setting left on its default
 is left out on purpose, so it keeps following the default if a later release
