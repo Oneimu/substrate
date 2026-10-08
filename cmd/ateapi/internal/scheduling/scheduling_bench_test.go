@@ -20,18 +20,22 @@ import (
 	"testing"
 
 	"github.com/agent-substrate/substrate/internal/resources"
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
 // benchFleet is a fleet of n active workers that each report CPU and memory
-// capacity and hold one actor's worth of allocation, the shape a worker has
-// under load, so Schedule exercises the resource comparison on every worker.
+// capacity and hold between one and fifteen residents, so allocation strings
+// vary across the fleet the way they do under load and the check sees memo
+// misses as well as hits, while Schedule exercises the comparison on every
+// worker.
 func benchFleet(n int) fleet {
 	f := make(fleet, 0, n)
 	for i := range n {
-		f = append(f, worker(fmt.Sprintf("w-%d", i), "gvisor", "node-a", nil,
-			withMaxActors(16),
-			withCapacity(16000, 64<<30),
-			assignedFor("demo", "resident", resources.CPUMemory(500, 1<<30))))
+		opts := []func(*ateapipb.Worker){withMaxActors(16), withCapacity(16000, 64<<30)}
+		for r := range i%15 + 1 {
+			opts = append(opts, assignedFor("demo", fmt.Sprintf("resident-%d", r), resources.CPUMemory(500, 1<<30)))
+		}
+		f = append(f, worker(fmt.Sprintf("w-%d", i), "gvisor", "node-a", nil, opts...))
 	}
 	return f
 }

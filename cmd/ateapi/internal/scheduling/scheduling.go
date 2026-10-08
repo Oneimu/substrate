@@ -108,7 +108,7 @@ func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ate
 
 	// One check for the whole pass: it parses the actor's size once, not once
 	// per worker, and remembers every worker quantity string it has read.
-	check, err := resources.NewRoomCheck(constraints.Limits)
+	check, err := NewRoomCheck(constraints.Limits)
 	if err != nil {
 		return nil, fmt.Errorf("while parsing actor resource limits: %w", err)
 	}
@@ -243,7 +243,7 @@ func (s *scheduler) Applies(worker *ateapipb.Worker, constraints Constraints) bo
 // having no room: it is the only answer that cannot overcommit a worker whose
 // true occupancy is unreadable.
 func (s *scheduler) HasRoom(worker *ateapipb.Worker, constraints Constraints) bool {
-	check, err := resources.NewRoomCheck(constraints.Limits)
+	check, err := NewRoomCheck(constraints.Limits)
 	if err != nil {
 		return false
 	}
@@ -252,7 +252,7 @@ func (s *scheduler) HasRoom(worker *ateapipb.Worker, constraints Constraints) bo
 
 // hasRoomWithCheck is HasRoom for a check already built, so Schedule can ask
 // it of every worker without parsing the actor's size again for each.
-func hasRoomWithCheck(worker *ateapipb.Worker, check *resources.RoomCheck) bool {
+func hasRoomWithCheck(worker *ateapipb.Worker, check *RoomCheck) bool {
 	capacity := worker.GetStatus().GetCapacity()
 	used := worker.GetStatus().GetAllocated()
 

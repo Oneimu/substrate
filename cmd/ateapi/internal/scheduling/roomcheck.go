@@ -12,20 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package resources
+package scheduling
 
 import (
+	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // RoomCheck asks whether Workers have room for one more Actor of a fixed
-// size. Placement asks that of the whole fleet on every call, so a RoomCheck
-// parses the Actor's size once, reads each Worker's wire form without building
-// a Quantities map, and memoizes every quantity string it parses: a fleet has
-// few distinct ones, so past the first Workers a check parses nothing.
-//
-// A RoomCheck belongs to one goroutine; nothing in it is locked.
+// size. It parses the size once and memoizes every Worker quantity string it
+// reads, so a pass over the fleet parses each distinct string once. Not safe
+// for concurrent use.
 type RoomCheck struct {
 	// names and need are the Actor's size, one dimension per index. Sizes
 	// have two or three dimensions, so a scan over names beats a map.
@@ -43,9 +41,9 @@ type parsedQuantity struct {
 }
 
 // NewRoomCheck prepares to place an Actor asking for want. It errors, as
-// ParseQuantities does, on a quantity it cannot parse.
+// resources.ParseQuantities does, on a quantity it cannot parse.
 func NewRoomCheck(want *ateapipb.Resources) (*RoomCheck, error) {
-	quantities, err := ParseQuantities(want)
+	quantities, err := resources.ParseQuantities(want)
 	if err != nil {
 		return nil, err
 	}
@@ -65,12 +63,9 @@ func NewRoomCheck(want *ateapipb.Resources) (*RoomCheck, error) {
 	return c, nil
 }
 
-// Admits reports whether capacity less allocated covers the Actor's size in
-// every dimension it names, as ParseQuantities, Sub, and Covers would answer:
-// a repeated name sums, a dimension the Worker does not report is none of it,
-// and an overcommitted dimension covers nothing. An Actor asking for nothing
-// fits anywhere. An entry that will not parse, in any dimension, means no
-// room: the Worker's true occupancy is unreadable.
+// Admits reports whether capacity less allocated covers the Actor's size,
+// with the same answers as resources.Quantities' Sub then Covers. An entry
+// that will not parse means no room: the Worker's occupancy is unreadable.
 func (c *RoomCheck) Admits(capacity, allocated *ateapipb.Resources) bool {
 	if len(c.names) == 0 {
 		return true

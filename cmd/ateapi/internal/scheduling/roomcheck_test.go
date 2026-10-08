@@ -12,14 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package resources
+package scheduling
 
 import (
 	"testing"
 
+	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
+
+func limits(pairs ...string) *ateapipb.Resources {
+	out := &ateapipb.Resources{}
+	for i := 0; i < len(pairs); i += 2 {
+		out.Limits = append(out.Limits, &ateapipb.Limits{Name: pairs[i], Quantity: pairs[i+1]})
+	}
+	return out
+}
 
 // RoomCheck reads the wire form directly, so it is held to the same answers as
 // parsing everything into Quantities and calling Sub then Covers.
@@ -116,6 +125,21 @@ func TestRoomCheckAgreesWithQuantities(t *testing.T) {
 			allocated: limits("memory", "2049Mi"),
 			ok:        false,
 		},
+		{
+			// Nine decimal places under a ten-digit byte count overflow an int64
+			// at nano scale, so these stay inf.Dec: the slow arithmetic path.
+			name:      "quantities that stay inf.Dec fit",
+			want:      limits("memory", "1.5Gi"),
+			capacity:  limits("memory", "12.000000001Gi"),
+			allocated: limits("memory", "9.000000001Gi"),
+			ok:        true,
+		},
+		{
+			name:      "quantities that stay inf.Dec come up short",
+			want:      limits("memory", "1.5Gi"),
+			capacity:  limits("memory", "12.000000001Gi"),
+			allocated: limits("memory", "10.600000001Gi"),
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -137,18 +161,18 @@ func TestRoomCheckAgreesWithQuantities(t *testing.T) {
 // referenceAnswer is the question asked the long way, through Quantities.
 func referenceAnswer(t *testing.T, want, capacity, allocated *ateapipb.Resources) bool {
 	t.Helper()
-	need, err := ParseQuantities(want)
+	need, err := resources.ParseQuantities(want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	free, err := ParseQuantities(capacity)
+	free, err := resources.ParseQuantities(capacity)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if free == nil {
-		free = Quantities{}
+		free = resources.Quantities{}
 	}
-	used, err := ParseQuantities(allocated)
+	used, err := resources.ParseQuantities(allocated)
 	if err != nil {
 		t.Fatal(err)
 	}
