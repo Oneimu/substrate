@@ -12,8 +12,8 @@ Two joinable JSON log records feed it, each written by both layers:
 
 | record (`msg`) | emitter | keys |
 |---|---|---|
-| `Restore timing breakdown` | atelet and ateom-microvm | `ate.actor.restore.duration.<phase>` / `ateom.actor.restore.duration.<phase>` |
-| `Checkpoint timing breakdown` | atelet and ateom-microvm | `ate.actor.checkpoint.duration.<phase>` / `ateom.actor.checkpoint.duration.<phase>` |
+| `Restore timing breakdown` | atelet, ateom-microvm and ateom-gvisor | `ate.actor.restore.duration.<phase>` / `ateom.actor.restore.duration.<phase>` |
+| `Checkpoint timing breakdown` | atelet, ateom-microvm and ateom-gvisor | `ate.actor.checkpoint.duration.<phase>` / `ateom.actor.checkpoint.duration.<phase>` |
 
 Every record carries the full actor identity (`ate.actor.uid`, name,
 atespace, template) and the snapshot scope, which the histograms are barred
@@ -74,13 +74,18 @@ A failed atelet operation still writes its record, marked with `error.type`
 **Phase percentiles.** Per layer, operation, sandbox class, snapshot kind,
 scope and phase: count, p50, p90, p95 and max. A `golden` restore downloads
 the golden image and a `latest` one the actor's own, so they are separate
-rows, as are gVisor and micro-VM checkpoints. The atelet rows split a checkpoint between
-`sandbox_assets`, `ateom_checkpoint` and `persist`, and a restore between
-`volume_mount`, `manifest_fetch`, `sandbox_assets`, `download`, `oci_unpack`
-and `ateom_restore`. The ateom rows split the `ateom_*` phase further:
+rows, as are gVisor and micro-VM operations. The atelet rows split a
+checkpoint between `sandbox_assets`, `ateom_checkpoint` and `persist`, and a
+restore between `volume_mount`, `manifest_fetch`, `sandbox_assets`,
+`download`, `oci_unpack` and `ateom_restore`. The ateom rows split the
+`ateom_*` phase further with the runtime's own phases: for micro-VM
 `prep` / `pause` / `snapshot` / `durable_dir` / `rootfs_upper` / `teardown`
-for a checkpoint, `prep` / `bundles` / `upper_join` / `lowers` / `tap` /
-`vmm_launch` / `vm_restore` / `resume` / `wakeup_probe` for a restore.
+on a checkpoint and `prep` / … / `vm_restore` / `wakeup_probe` on a restore;
+for gVisor `pause` / `checkpoint` / `durable_dir` / `resume` / `teardown` and
+`prep` / `net_setup` / … / `pause_restore` / `app_restore` / `wakeup_probe` /
+`activate` (the full lists are in `cmd/ateom-*/phaselog.go`). The ateom
+records carry no sandbox class or kind of their own; a paired one takes both
+from its atelet record, so both layers split into the same rows.
 
 Concurrency matters when reading them: the atelet restore phases overlap
 (the download runs alongside the asset fetch and OCI unpack), the three

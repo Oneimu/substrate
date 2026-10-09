@@ -138,7 +138,7 @@ def collect_phase_breakdown(v1: client.CoreV1Api, since_seconds: int,
         reads.pods_read += got.pods_read
         reads.pods_failed += got.pods_failed
         phase_report.parse_lines(got.lines, parsed)
-    phase_report.pair_records(parsed.breakdowns)
+    phase_report.join_layers(parsed.breakdowns)
     rows = phase_report.report_phases(parsed.breakdowns, lambda _: None)
     return rows, parsed, reads
 
