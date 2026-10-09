@@ -53,7 +53,8 @@ STATS_CSV = ("Type,Name,Request Count,Failure Count\n"
              "grpc,SuspendActor,0,0\ngrpc,ResumeActor,1,0\n,Aggregated,1,0\n")
 
 
-def fake_api(logs_by_namespace, broken_pod=None, restarted=False, previous_logs=None):
+def fake_api(logs_by_namespace, broken_pod=None, restarted=False, previous_logs=None,
+             previous_missing=False):
     """Stand-in CoreV1Api: one pod per namespace, its log from the mapping."""
     api = mock.Mock()
     api.list_namespaced_pod.side_effect = lambda namespace, **_: SimpleNamespace(
@@ -64,6 +65,8 @@ def fake_api(logs_by_namespace, broken_pod=None, restarted=False, previous_logs=
     def read_log(name, namespace, previous=False, **_):
         if name == broken_pod:
             raise ApiException(status=400, reason="container is being created")
+        if previous and previous_missing:
+            raise ApiException(status=400, reason="previous terminated container not found")
         source = (previous_logs or {}) if previous else logs_by_namespace
         # The raw (un-preloaded) response the code asks for: bytes in .data.
         return SimpleNamespace(data=source.get(namespace, "").encode())
@@ -103,10 +106,33 @@ class PhaseBreakdownTest(unittest.TestCase):
         self.assertEqual(summary["measurements"]["locust_ResumeActor"], "1")
         self.assertEqual((summary["measurements"]["pods_read"], summary["measurements"]["pods_failed"]), ("2", "0"))
 
-    def test_fewer_records_than_requests_is_warned(self):
+    def test_fewer_records_than_successful_requests_is_warned(self):
         api = fake_api({"ate-system": ATELET, "benchmark-workloads": ATEOM})
-        _, _, output = append(api, stats=STATS_CSV.replace("ResumeActor,1", "ResumeActor,5"))
-        self.assertIn("Warning: locust made 5 ResumeActor requests but the atelet logs hold 1", output)
+        _, entries, output = append(api, stats=STATS_CSV.replace("ResumeActor,1,0", "ResumeActor,5,0"))
+        self.assertIn("Warning: locust made 5 successful ResumeActor requests but the atelet logs hold 1", output)
+        self.assertIn("a node log was rotated", output)
+        summary = next(e for e in entries if e["metric"] == "phase_breakdown_summary")
+        self.assertEqual(summary["measurements"]["locust_ResumeActor_failures"], "0")
+
+    def test_requests_that_never_reached_atelet_are_not_owed_a_record(self):
+        # 5 requests, 4 failed client-side: only 1 successful one reached atelet.
+        api = fake_api({"ate-system": ATELET, "benchmark-workloads": ATEOM})
+        _, _, output = append(api, stats=STATS_CSV.replace("ResumeActor,1,0", "ResumeActor,5,4"))
+        self.assertNotIn("Warning: locust made", output)
+
+    def test_missing_records_blame_unreadable_pods_when_there_are_any(self):
+        api = fake_api({"ate-system": ATELET, "benchmark-workloads": ATEOM}, broken_pod="ate-system-pod")
+        _, _, output = append(api)
+        self.assertIn("1 pod(s) could not be read", output)
+        self.assertNotIn("rotated", output)
+
+    def test_a_missing_previous_log_keeps_the_current_one(self):
+        api = fake_api({"ate-system": ATELET, "benchmark-workloads": ATEOM}, restarted=True, previous_missing=True)
+        _, entries, output = append(api)
+        self.assertIn("no previous log for", output)
+        self.assertTrue(any(e["metric"].startswith("phase_atelet_restore") for e in entries))
+        summary = next(e for e in entries if e["metric"] == "phase_breakdown_summary")
+        self.assertEqual((summary["measurements"]["pods_read"], summary["measurements"]["pods_failed"]), ("2", "0"))
 
     def test_an_unreadable_pod_is_skipped_not_fatal(self):
         api = fake_api({"ate-system": ATELET, "benchmark-workloads": ATEOM},

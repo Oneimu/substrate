@@ -104,25 +104,32 @@ def read_pod_logs(v1: client.CoreV1Api, namespace: str, label: str,
         restarted = any(getattr(c, "restart_count", 0) for c in statuses)
         try:
             text = _read_log(v1, name, namespace, since_seconds)
-            if restarted:
-                text += "\n" + _read_log(v1, name, namespace, since_seconds, previous=True)
         except Exception as e:
             _log(logs, f"Notice: could not read logs of {namespace}/{name}: "
                        f"{getattr(e, 'reason', e)}")
             out.pods_failed += 1
             continue
+        if restarted:
+            # kubelet may have discarded the previous container's log already;
+            # that loses the records before the restart, not the current log.
+            try:
+                text += "\n" + _read_log(v1, name, namespace, since_seconds, previous=True)
+            except Exception as e:
+                _log(logs, f"Notice: no previous log for {namespace}/{name}: "
+                           f"{getattr(e, 'reason', e)}")
         out.pods_read += 1
         out.lines.extend(text.splitlines())
     return out
 
 
-def locust_request_counts(stats_csv: Path) -> dict[str, int]:
-    """SuspendActor / ResumeActor request counts from locust's stats.csv."""
-    counts: dict[str, int] = {}
+def locust_request_counts(stats_csv: Path) -> dict[str, tuple[int, int]]:
+    """SuspendActor / ResumeActor (requests, failures) from locust's stats.csv."""
+    counts: dict[str, tuple[int, int]] = {}
     with open(stats_csv) as f:
         for row in csv.DictReader(f):
             if row.get("Name") in LOCUST_OP_NAMES.values():
-                counts[row["Name"]] = int(row.get("Request Count") or 0)
+                counts[row["Name"]] = (int(row.get("Request Count") or 0),
+                                       int(row.get("Failure Count") or 0))
     return counts
 
 
@@ -151,9 +158,11 @@ def append_phase_breakdown(jsonl_path: Path, stats_csv: Path, since_seconds: int
     A phase_breakdown_summary row is always written once the API was
     reachable, so a run with no records is distinguishable from a run where
     the reads failed: it carries the pods read and failed, and the atelet
-    record counts next to locust's SuspendActor / ResumeActor request counts.
-    Fewer records than requests means a node log was rotated during the run
-    and the percentiles come from a partial sample; the log says so.
+    record counts next to locust's SuspendActor / ResumeActor request and
+    failure counts. A successful request must have reached atelet, so fewer
+    atelet records than successful requests means records were lost: to pods
+    that could not be read if there were any, else to a node log rotated
+    during the run. The log says which.
     """
     if not _load_kube_config(logs):
         return 0
@@ -164,15 +173,19 @@ def append_phase_breakdown(jsonl_path: Path, stats_csv: Path, since_seconds: int
     summary: dict[str, Any] = {"records": parsed.lines_matched,
                                "pods_read": reads.pods_read, "pods_failed": reads.pods_failed}
     for op, request_name in LOCUST_OP_NAMES.items():
-        # Failed operations count too: locust's request count includes them.
         got = sum(1 for b in parsed.breakdowns if b.source == "atelet" and b.op == op)
         summary[f"atelet_{op}_records"] = got
         if request_name in expected:
-            summary[f"locust_{request_name}"] = expected[request_name]
-            if got < expected[request_name]:
-                _log(logs, f"Warning: locust made {expected[request_name]} {request_name} "
-                           f"requests but the atelet logs hold {got} {op} records; "
-                           f"a node log was rotated during the run")
+            requests, failures = expected[request_name]
+            summary[f"locust_{request_name}"] = requests
+            summary[f"locust_{request_name}_failures"] = failures
+            # A request that failed before reaching atelet leaves no record,
+            # so only the successful ones are owed one.
+            if got < requests - failures:
+                cause = (f"{reads.pods_failed} pod(s) could not be read" if reads.pods_failed
+                         else "a node log was rotated during the run")
+                _log(logs, f"Warning: locust made {requests - failures} successful {request_name} "
+                           f"requests but the atelet logs hold {got} {op} records; {cause}")
     if not rows:
         _log(logs, f"Warning: no timing breakdown records in the node logs "
                    f"({reads.pods_read} pods read, {reads.pods_failed} failed); "
