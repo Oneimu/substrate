@@ -18,6 +18,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -84,5 +85,56 @@ func TestPruneReportsFailureAndStillRemovesTheRest(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
 			t.Errorf("%s still exists (err=%v), want removed", name, err)
 		}
+	}
+}
+
+func TestPruneKeepsTheNamedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"pause-1", "pause-2"} {
+		if err := os.MkdirAll(filepath.Join(dir, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name, "checkpoint.img"), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	plan, err := planLocalCheckpointPruneDir(dir, "pause-2")
+	if err != nil {
+		t.Fatalf("planLocalCheckpointPruneDir() = %v, want nil", err)
+	}
+	if want := []string{filepath.Join(dir, "pause-1")}; !slices.Equal(plan.paths, want) {
+		t.Fatalf("planned paths = %v, want %v", plan.paths, want)
+	}
+	// A snapshot written after the plan is not the plan's to remove.
+	if err := os.MkdirAll(filepath.Join(dir, "pause-3"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.run(context.Background()); err != nil {
+		t.Fatalf("run() = %v, want nil", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "pause-1")); !os.IsNotExist(err) {
+		t.Errorf("pause-1 survived the prune (stat err = %v)", err)
+	}
+	for _, name := range []string{"pause-2", "pause-3"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("%s did not survive the prune: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("the local checkpoints dir was removed although a snapshot was kept: %v", err)
+	}
+}
+
+func TestPruneKeepOfMissingDirPlansNothing(t *testing.T) {
+	plan, err := planLocalCheckpointPruneDir(filepath.Join(t.TempDir(), "absent"), "pause-1")
+	if err != nil {
+		t.Fatalf("planLocalCheckpointPruneDir() = %v, want nil", err)
+	}
+	if len(plan.paths) != 0 {
+		t.Fatalf("planned paths = %v, want none", plan.paths)
+	}
+	if err := plan.run(context.Background()); err != nil {
+		t.Fatalf("run() = %v, want nil", err)
 	}
 }

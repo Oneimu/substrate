@@ -294,6 +294,142 @@ func TestLocalSnapshotGC(t *testing.T) {
 	}
 }
 
+// TestPauseAgainPrunesThePreviousSnapshotAfterTheResponse checks that a pause
+// following a resume leaves the new local snapshot in place and removes the
+// previous one, and that the removal is not something the Checkpoint response
+// waited for.
+func TestPauseAgainPrunesThePreviousSnapshotAfterTheResponse(t *testing.T) {
+	useTempNodeDirs(t)
+	ctx := t.Context()
+
+	const (
+		atespace  = "ate-demo"
+		actorName = "counter"
+		actorUID  = "actor-uid-2"
+		ateomUID  = "ateom-uid-2"
+	)
+
+	ateom := &fakeAteom{snapshotFiles: map[string]string{"checkpoint.img": "guest-memory"}}
+	serveFakeAteom(t, ateom)
+
+	host := imageVolumeTestRegistry(t)
+	image := host + "/actor:v1"
+	pushTestImage(t, image, singleFileLayer(t, "bin/app", "app"))
+
+	runsc := []byte("runsc binary")
+	s := &AteomHerder{
+		ateomDialer:       newAteomDialer(1),
+		imageCache:        newImageVolumeStore(t),
+		anonGCSClient:     fakeObjectStorage{data: runsc},
+		systemInfoVolumes: newSystemInfoVolumeRefresher(nil, nil),
+	}
+	sandboxAssets := &ateletpb.SandboxAssets{
+		SandboxClass: "gvisor",
+		PauseImage:   image,
+		Assets: map[string]*ateletpb.ArchAssets{
+			runtime.GOARCH: {Files: map[string]*ateletpb.AssetFile{
+				runscAssetName: {
+					Url:    "gs://test-bucket/runsc",
+					Sha256: fmt.Sprintf("%x", sha256.Sum256(runsc)),
+				},
+			}},
+		},
+	}
+	spec := &ateletpb.WorkloadSpec{
+		Containers: []*ateletpb.Container{{Name: "app", Image: image, Command: []string{"/bin/app"}}},
+	}
+	pause := func(snapshotName string) {
+		t.Helper()
+		if _, err := s.Checkpoint(ctx, &ateletpb.CheckpointRequest{
+			Atespace:              atespace,
+			ActorName:             actorName,
+			ActorUid:              actorUID,
+			ActorTemplateAtespace: "default",
+			ActorTemplateName:     "counter",
+			WorkerPodUid:          ateomUID,
+			Spec:                  spec,
+			Fidelity:              ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+			Type:                  ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL,
+			Config: &ateletpb.CheckpointRequest_LocalConfig{
+				LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: snapshotName},
+			},
+		}); err != nil {
+			t.Fatalf("Checkpoint(%s): %v", snapshotName, err)
+		}
+	}
+	resume := func(snapshotName string) {
+		t.Helper()
+		if _, err := s.Restore(ctx, &ateletpb.RestoreRequest{
+			Atespace:              atespace,
+			ActorName:             actorName,
+			ActorUid:              actorUID,
+			ActorTemplateAtespace: "default",
+			ActorTemplateName:     "counter",
+			WorkerPodUid:          ateomUID,
+			SandboxAssets:         sandboxAssets,
+			Spec:                  spec,
+			Fidelity:              ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+			Type:                  ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL,
+			Config: &ateletpb.RestoreRequest_LocalConfig{
+				LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: snapshotName},
+			},
+		}); err != nil {
+			t.Fatalf("Restore(%s): %v", snapshotName, err)
+		}
+	}
+	snapshotDir := func(name string) string { return ateletpath.LocalSnapshotDir(actorUID, name) }
+
+	if _, err := s.Run(ctx, &ateletpb.RunRequest{
+		Atespace:              atespace,
+		ActorName:             actorName,
+		ActorUid:              actorUID,
+		ActorTemplateAtespace: "default",
+		ActorTemplateName:     "counter",
+		WorkerPodUid:          ateomUID,
+		SandboxAssets:         sandboxAssets,
+		Spec:                  spec,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	pause("pause-snap-1")
+	s.localCheckpointPrunes.Wait()
+	if _, err := os.Stat(snapshotDir("pause-snap-1")); err != nil {
+		t.Fatalf("first pause did not leave its snapshot: %v", err)
+	}
+
+	resume("pause-snap-1")
+	pause("pause-snap-2")
+	// The second pause's response does not wait for the first snapshot's
+	// removal; whatever state that removal is in, the new snapshot is complete.
+	if _, err := os.Stat(filepath.Join(snapshotDir("pause-snap-2"), "checkpoint.img")); err != nil {
+		t.Fatalf("second pause did not leave its snapshot: %v", err)
+	}
+	s.localCheckpointPrunes.Wait()
+	if _, err := os.Stat(snapshotDir("pause-snap-1")); !os.IsNotExist(err) {
+		t.Errorf("first snapshot survived the second pause (stat err = %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(snapshotDir("pause-snap-2"), "checkpoint.img")); err != nil {
+		t.Errorf("second snapshot did not survive its own prune: %v", err)
+	}
+
+	// Terminate still clears the directory synchronously.
+	if _, err := s.Terminate(ctx, &ateletpb.TerminateRequest{
+		Atespace:              atespace,
+		ActorName:             actorName,
+		ActorUid:              actorUID,
+		ActorTemplateAtespace: "default",
+		ActorTemplateName:     "counter",
+		WorkerPodUid:          ateomUID,
+		Spec:                  spec,
+	}); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	if _, err := os.Stat(ateletpath.LocalCheckpointsDir(actorUID)); !os.IsNotExist(err) {
+		t.Errorf("local checkpoint dir survived terminate (stat err = %v)", err)
+	}
+}
+
 // TestRestoreUsesRequestSandboxAssets checks that Restore runs the actor with
 // the sandbox assets on the request, not the ones recorded in the snapshot
 // manifest.

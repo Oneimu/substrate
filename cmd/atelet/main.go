@@ -467,9 +467,54 @@ type AteomHerder struct {
 	volumePlugins         map[string]volume.VolumePluginWorkerPlane
 	csiDriverConfigGetter csi.CSIDriverConfigGetter
 	systemInfoVolumes     *systemInfoVolumeRefresher
+
+	// localCheckpointPrunes counts the removals of superseded pause snapshots
+	// that Checkpoint and UploadPausedCheckpoint leave running past their
+	// response; tests wait on it. localCheckpointLocks serializes those
+	// removals with Terminate's, per actor, so neither fails on a directory
+	// the other is emptying.
+	localCheckpointPrunes sync.WaitGroup
+	localCheckpointLocks  sync.Map // actor UID -> *sync.Mutex
 }
 
 var _ ateletpb.AteomHerderServer = (*AteomHerder)(nil)
+
+// lockLocalCheckpoints serializes removals under an actor's local-checkpoint
+// directory and returns the unlock.
+func (s *AteomHerder) lockLocalCheckpoints(actorUID string) (unlock func()) {
+	v, _ := s.localCheckpointLocks.LoadOrStore(actorUID, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// pruneLocalCheckpointsAfterResponse removes the actor's local snapshots other
+// than keep without making the caller wait for it. The snapshots are listed
+// here, on the request path, so the removal can never reach a snapshot a
+// later pause writes; the deletions run after the response because they wait
+// on the node's disk: a snapshot written one pause ago is still being flushed
+// when the disk is behind, and unlinking it then stalls for seconds that
+// nothing above atelet needs to spend. A crash before the removal completes
+// leaves directories that the next prune or Terminate collects.
+func (s *AteomHerder) pruneLocalCheckpointsAfterResponse(ctx context.Context, actorRef resources.ActorRef, actorUID, keep string) {
+	plan, err := planLocalCheckpointPrune(actorUID, keep)
+	if err != nil {
+		slog.WarnContext(ctx, "failed to list superseded local checkpoints", slog.Any("actor", actorRef), slog.Any("err", err))
+		return
+	}
+	if plan.empty() {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	s.localCheckpointPrunes.Add(1)
+	go func() {
+		defer s.localCheckpointPrunes.Done()
+		defer s.lockLocalCheckpoints(actorUID)()
+		if err := plan.run(ctx); err != nil {
+			slog.WarnContext(ctx, "failed to prune superseded local checkpoints", slog.Any("actor", actorRef), slog.Any("err", err))
+		}
+	}()
+}
 
 // NewService creates a new WorkersManagerService.
 func NewService(
@@ -724,25 +769,6 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	sandboxRec.ActorTemplateName = req.GetActorTemplateName()
 	sandboxRec.Fidelity = ateattr.SnapshotFidelityValue(req.GetFidelity())
 
-	// No earlier pause snapshot can ever be restored again, so remove them
-	// all: the actor's current state was just captured by CheckpointWorkload,
-	// and the control plane tracks only a single local snapshot, which this
-	// checkpoint either overwrites (pause) or clears (suspend).
-	//
-	// Do not move this above CheckpointWorkload to keep MergeDeltaIntoBase on its
-	// in-place path: that leaves the whole checkpoint window with no local snapshot
-	// while LocalSnapshotInfo still names the pruned one, and a crash there strands
-	// the actor for good (resume never falls back to object storage, RequiredNodes
-	// pins it to this node, nothing clears the field).
-	//
-	// Best-effort: if this fail, the actor's terminate prunes again.
-	if err := pruneLocalCheckpoints(ctx, actorUID); err != nil {
-		slog.WarnContext(ctx, "failed to prune superseded local checkpoints", slog.Any("actor", actorRef), slog.Any("err", err))
-	}
-
-	// Pruning stays outside the persist window: it collects superseded
-	// snapshots on both paths, so timing it as part of an external upload would
-	// mix local disk deletion into the object-storage measurement.
 	tPersist := time.Now()
 	switch req.GetType() {
 	case ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL:
@@ -764,6 +790,25 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 		return nil, fmt.Errorf("unexpected checkpoint type: %v", req.GetType())
 	}
 	dPersist = time.Since(tPersist)
+
+	// No earlier pause snapshot can ever be restored again: the actor's current
+	// state was just captured by CheckpointWorkload and is now in place (pause)
+	// or uploaded (suspend), and the control plane tracks only a single local
+	// snapshot, which this checkpoint either overwrote or cleared.
+	//
+	// Not before CheckpointWorkload, to keep MergeDeltaIntoBase on its in-place
+	// path: that would leave the whole checkpoint window with no local snapshot
+	// while LocalSnapshotInfo still names the pruned one, and a crash there
+	// strands the actor for good (resume never falls back to object storage,
+	// RequiredNodes pins it to this node, nothing clears the field). Not before
+	// persist either, so a failed upload keeps the previous snapshot on the node.
+	//
+	// Best-effort and off the request path: if it fails, Terminate prunes again.
+	var keep string
+	if req.GetType() == ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL {
+		keep = req.GetLocalConfig().GetSnapshotName()
+	}
+	s.pruneLocalCheckpointsAfterResponse(ctx, actorRef, actorUID, keep)
 
 	if err := s.unmountExternalVolumes(ctx, actorUID, req.GetSpec().GetVolumes()); err != nil {
 		return nil, fmt.Errorf("while unmounting external volumes: %w", err)
@@ -959,10 +1004,9 @@ func (s *AteomHerder) UploadPausedCheckpoint(ctx context.Context, req *ateletpb.
 	}
 
 	// The uploaded snapshot supersedes every local pause snapshot of this
-	// actor; free the node's disk (best-effort, like Checkpoint).
-	if err := pruneLocalCheckpoints(ctx, req.GetActorUid()); err != nil {
-		slog.WarnContext(ctx, "failed to prune uploaded local checkpoints", slog.String("actorUID", req.GetActorUid()), slog.Any("err", err))
-	}
+	// actor; free the node's disk (best-effort and off the request path, like
+	// Checkpoint).
+	s.pruneLocalCheckpointsAfterResponse(ctx, resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}, req.GetActorUid(), "")
 
 	return &ateletpb.UploadPausedCheckpointResponse{}, nil
 }
@@ -1342,8 +1386,12 @@ func (s *AteomHerder) Terminate(ctx context.Context, req *ateletpb.TerminateRequ
 	// up the copies on any other NodeVmsWithLocalSnapshots. This is fine *as of
 	// the day this was written* because today NodeVmsWithLocalSnapshots has at
 	// most one item.
-	if err := pruneLocalCheckpoints(ctx, actorUID); err != nil {
-		return nil, fmt.Errorf("failed to prune local checkpoints during terminate (actor: %s, actorUID: %s): %w", actorRef, actorUID, err)
+	unlock := s.lockLocalCheckpoints(actorUID)
+	pruneErr := pruneLocalCheckpoints(ctx, actorUID)
+	unlock()
+	s.localCheckpointLocks.Delete(actorUID)
+	if pruneErr != nil {
+		return nil, fmt.Errorf("failed to prune local checkpoints during terminate (actor: %s, actorUID: %s): %w", actorRef, actorUID, pruneErr)
 	}
 
 	// Reclaim the actor's directories on the node
