@@ -31,7 +31,8 @@ func limits(pairs ...string) *ateapipb.Resources {
 }
 
 // RoomCheck reads the wire form directly, so it is held to the same answers as
-// parsing everything into Quantities and calling Sub then Covers.
+// parsing everything into Quantities, subtracting, and comparing dimension by
+// dimension.
 func TestRoomCheckAgreesWithQuantities(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -152,13 +153,17 @@ func TestRoomCheckAgreesWithQuantities(t *testing.T) {
 				t.Errorf("Admits() = %v, want %v", got, tc.ok)
 			}
 			if ref := referenceAnswer(t, tc.want, tc.capacity, tc.allocated); got != ref {
-				t.Errorf("Admits() = %v but Quantities.Sub then Covers says %v", got, ref)
+				t.Errorf("Admits() = %v but the long way through Quantities says %v", got, ref)
 			}
 		})
 	}
 }
 
-// referenceAnswer is the question asked the long way, through Quantities.
+// referenceAnswer is the question asked the long way, through Quantities. It
+// is the specification Admits is checked against: capacity less allocated must
+// reach the Actor's size in every dimension the Actor names. A dimension the
+// Worker never reported reads as zero, since a Worker reports everything it
+// has, and a dimension gone negative from overcommit covers nothing.
 func referenceAnswer(t *testing.T, want, capacity, allocated *ateapipb.Resources) bool {
 	t.Helper()
 	need, err := resources.ParseQuantities(want)
@@ -177,7 +182,13 @@ func referenceAnswer(t *testing.T, want, capacity, allocated *ateapipb.Resources
 		t.Fatal(err)
 	}
 	free.Sub(used)
-	return free.Covers(need)
+	for name, q := range need {
+		have := free[name] // absent reads as the zero quantity
+		if have.Cmp(q) < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func TestRoomCheckUnreadableRecords(t *testing.T) {

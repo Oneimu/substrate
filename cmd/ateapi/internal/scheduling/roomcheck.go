@@ -63,9 +63,11 @@ func NewRoomCheck(want *ateapipb.Resources) (*RoomCheck, error) {
 	return c, nil
 }
 
-// Admits reports whether capacity less allocated covers the Actor's size,
-// with the same answers as resources.Quantities' Sub then Covers. An entry
-// that will not parse means no room: the Worker's occupancy is unreadable.
+// Admits reports whether capacity less allocated covers the Actor's size in
+// every dimension the Actor names. Names repeated in a record sum, a dimension
+// a Worker never reported is none of it, and an overcommitted dimension covers
+// nothing. An entry that will not parse means no room: the Worker's occupancy
+// is unreadable.
 func (c *RoomCheck) Admits(capacity, allocated *ateapipb.Resources) bool {
 	if len(c.names) == 0 {
 		return true
