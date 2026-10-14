@@ -79,7 +79,7 @@ func (p *localCheckpointPrune) run(ctx context.Context) error {
 	var errs []error
 	for _, path := range p.paths {
 		start := time.Now()
-		if err := os.RemoveAll(path); err != nil {
+		if err := removeLocalCheckpoint(path); err != nil {
 			errs = append(errs, fmt.Errorf("while pruning local checkpoint %s: %w", path, err))
 			continue
 		}
@@ -96,6 +96,10 @@ func (p *localCheckpointPrune) run(ctx context.Context) error {
 	}
 	return nil
 }
+
+// removeLocalCheckpoint deletes one snapshot directory; tests swap it for a
+// slow one to exercise the back-pressure path.
+var removeLocalCheckpoint = os.RemoveAll
 
 // pruneLocalCheckpoints removes every local snapshot of the actor. A missing
 // directory is not an error, so retries are safe.

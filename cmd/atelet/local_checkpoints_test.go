@@ -21,6 +21,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/agent-substrate/substrate/cmd/atelet/internal/ateletpath"
+	"github.com/agent-substrate/substrate/internal/resources"
 )
 
 func writeSnapshotDir(t *testing.T, dir, prefix string) {
@@ -136,5 +140,61 @@ func TestPruneKeepOfMissingDirPlansNothing(t *testing.T) {
 	}
 	if err := plan.run(context.Background()); err != nil {
 		t.Fatalf("run() = %v, want nil", err)
+	}
+}
+
+func TestPruneAfterResponseWaitsForThePreviousRemoval(t *testing.T) {
+	useTempNodeDirs(t)
+	const actorUID = "actor-uid-backpressure"
+	dir := ateletpath.LocalCheckpointsDir(actorUID)
+	for _, name := range []string{"pause-1", "pause-2"} {
+		writeSnapshotDir(t, dir, name)
+	}
+
+	// The first removal blocks until released, as a disk that is behind would.
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	orig := removeLocalCheckpoint
+	removeLocalCheckpoint = func(path string) error {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		return orig(path)
+	}
+	t.Cleanup(func() { removeLocalCheckpoint = orig })
+
+	s := &AteomHerder{}
+	ref := resources.ActorRef{Atespace: "ate-demo", Name: "counter"}
+	s.pruneLocalCheckpointsAfterResponse(context.Background(), ref, actorUID, "pause-2") // removes pause-1, slowly
+	<-started
+
+	// The next pause must wait for that removal before it writes anything:
+	// at most one superseded snapshot per actor is ever pending.
+	done := make(chan struct{})
+	go func() {
+		s.waitForLocalCheckpointRemoval(context.Background(), ref, actorUID)
+		writeSnapshotDir(t, dir, "pause-3")
+		s.pruneLocalCheckpointsAfterResponse(context.Background(), ref, actorUID, "pause-3")
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("second pause returned while the previous removal was still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second pause did not return after the previous removal finished")
+	}
+	s.localCheckpointPrunes.Wait()
+	for name, want := range map[string]bool{"pause-1": false, "pause-2": false, "pause-3": true} {
+		_, err := os.Stat(filepath.Join(dir, name))
+		if got := err == nil; got != want {
+			t.Errorf("%s exists = %v, want %v (err %v)", name, got, want, err)
+		}
 	}
 }

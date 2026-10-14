@@ -488,6 +488,20 @@ func (s *AteomHerder) lockLocalCheckpoints(actorUID string) (unlock func()) {
 	return mu.Unlock
 }
 
+// waitForLocalCheckpointRemoval blocks while a removal started by the actor's
+// previous Checkpoint or UploadPausedCheckpoint is still running. Called
+// before a new snapshot is written, it keeps the node at the current snapshot
+// plus at most one superseded one per actor: a disk that cannot delete as
+// fast as the actor checkpoints pushes back on the actor exactly as a
+// synchronous delete did, and only then. The wait is logged when it happens.
+func (s *AteomHerder) waitForLocalCheckpointRemoval(ctx context.Context, actorRef resources.ActorRef, actorUID string) {
+	start := time.Now()
+	s.lockLocalCheckpoints(actorUID)()
+	if d := time.Since(start); d > 10*time.Millisecond {
+		slog.InfoContext(ctx, "waited for the previous local checkpoint removal", slog.Any("actor", actorRef), slog.Duration("took", d))
+	}
+}
+
 // pruneLocalCheckpointsAfterResponse removes the actor's local snapshots other
 // than keep without making the caller wait for it. The snapshots are listed
 // here, on the request path, so the removal can never reach a snapshot a
@@ -496,6 +510,10 @@ func (s *AteomHerder) lockLocalCheckpoints(actorUID string) (unlock func()) {
 // when the disk is behind, and unlinking it then stalls for seconds that
 // nothing above atelet needs to spend. A crash before the removal completes
 // leaves directories that the next prune or Terminate collects.
+//
+// Disk space stays bounded by waitForLocalCheckpointRemoval at the start of
+// Checkpoint and UploadPausedCheckpoint: at most one removal per actor is in
+// flight, and a new snapshot is not written while one is still pending.
 func (s *AteomHerder) pruneLocalCheckpointsAfterResponse(ctx context.Context, actorRef resources.ActorRef, actorUID, keep string) {
 	plan, err := planLocalCheckpointPrune(actorUID, keep)
 	if err != nil {
@@ -672,6 +690,10 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 
 	actorUID := req.GetActorUid()
 	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
+
+	// Do not write a new snapshot while the previous pause's superseded one is
+	// still being removed (see waitForLocalCheckpointRemoval).
+	s.waitForLocalCheckpointRemoval(ctx, actorRef, actorUID)
 
 	// Per-phase timing, recorded on the way out so a failed checkpoint still
 	// reports the phases it completed. Phases left at zero never ran.
@@ -972,6 +994,7 @@ func (s *AteomHerder) UploadPausedCheckpoint(ctx context.Context, req *ateletpb.
 	if err := validateUploadPausedCheckpointRequest(req); err != nil {
 		return nil, apierror.InvalidArgument("%v", err)
 	}
+	s.waitForLocalCheckpointRemoval(ctx, resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}, req.GetActorUid())
 
 	tStart := time.Now()
 	var dPersist time.Duration
