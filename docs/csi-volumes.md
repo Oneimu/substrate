@@ -51,7 +51,7 @@ spec:
 | :--- | :--- | :--- |
 | `enabled` | `bool` | **Required.** Enables TLS/mTLS for the gRPC connection. |
 | `usePodIdentity` | `bool` | **Optional.** When `true`, reuses Substrate's SPIFFE Pod Identity certificates for mutual TLS (mTLS) with dynamic CA trust bundle verification and rotation. Must be `true` when `enabled` is `true`. |
-| `serverName` | `string` | **Optional.** Server name override for TLS certificate verification. |
+| `serverName` | `string` | **Required.** Expected server name (SAN) for TLS certificate verification when TLS is enabled. |
 
 > [!NOTE]
 > For details on exposing CSI controller endpoints over the network and configuring CSI node DaemonSets with required mount propagations, see the [CSI Driver Deployment Guide](csi-deployment.md).
@@ -154,6 +154,8 @@ metadata:
 spec:
   replicas: 5
   workerImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
+  sandboxClasses:
+  - name: gvisor
 ```
 
 The `ActorTemplate` is a protojson-shaped `ateapipb.ActorTemplate`, created

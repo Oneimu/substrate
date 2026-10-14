@@ -439,7 +439,7 @@ func TestAuthorizerAndPolicyManager_RuntimeChecks(t *testing.T) {
 	}
 	t.Cleanup(fgaSrv.Close)
 
-	authorizer, policyManager, err := New(ctx, pool, fgaSrv, nil)
+	authorizer, policyManager, err := New(ctx, pool, fgaSrv, nil, testSystemPrincipals())
 	if err != nil {
 		t.Fatalf("authz.New failed: %v", err)
 	}
@@ -544,5 +544,18 @@ func TestFormatUser_NoCollision(t *testing.T) {
 	u2 := formatUser("user:alice")
 	if u1 == u2 {
 		t.Fatalf("formatUser(\"alice\") and formatUser(\"user:alice\") collided on %q", u1)
+	}
+}
+
+func TestAtespacedObjects_NoCollision(t *testing.T) {
+	// '/' separates the atespace from the name, so a '/' inside either must
+	// not produce another resource's ID.
+	for _, format := range []func(atespace, name string) string{ActorObject, ActorTemplateObject} {
+		if o1, o2 := format("a/b", "c"), format("a", "b/c"); o1 == o2 {
+			t.Errorf("(%q, %q) and (%q, %q) collided on %q", "a/b", "c", "a", "b/c", o1)
+		}
+	}
+	if o1, o2 := ActorObject("a", "b"), ActorTemplateObject("a", "b"); o1 == o2 {
+		t.Errorf("ActorObject and ActorTemplateObject collided on %q", o1)
 	}
 }

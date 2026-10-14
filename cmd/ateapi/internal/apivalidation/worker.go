@@ -71,14 +71,31 @@ func ValidateDrainWorkerRequest(ctx context.Context, req *ateapipb.DrainWorkerRe
 	return Validate_DrainWorkerRequest(ctx, op, nil, req, nil)
 }
 
-func ValidateSetWorkerCapacityRequest(ctx context.Context, req *ateapipb.SetWorkerCapacityRequest) field.ErrorList {
+func ValidateRegisterWorkerRequest(ctx context.Context, req *ateapipb.RegisterWorkerRequest) field.ErrorList {
 	op := operation.Operation{Type: operation.Create}
-	return Validate_SetWorkerCapacityRequest(ctx, op, nil, req, nil)
+	return Validate_RegisterWorkerRequest(ctx, op, nil, req, nil)
 }
 
 func ValidateRequestActorSuspendRequest(ctx context.Context, req *ateapipb.RequestActorSuspendRequest) field.ErrorList {
 	op := operation.Operation{Type: operation.Create}
 	return Validate_RequestActorSuspendRequest(ctx, op, nil, req, nil)
+}
+
+func ValidateMarkWorkerAvailableRequest(ctx context.Context, req *ateapipb.MarkWorkerAvailableRequest) field.ErrorList {
+	// Call the generated validation.
+	op := operation.Operation{Type: operation.Create}
+	return Validate_MarkWorkerAvailableRequest(ctx, op, nil, req, nil)
+}
+
+func ValidateMarkWorkerUnavailableRequest(ctx context.Context, req *ateapipb.MarkWorkerUnavailableRequest) field.ErrorList {
+	// Call the generated validation.
+	op := operation.Operation{Type: operation.Create}
+	return Validate_MarkWorkerUnavailableRequest(ctx, op, nil, req, nil)
+}
+
+func ValidateReportActorSnapshotStateRequest(ctx context.Context, req *ateapipb.ReportActorSnapshotStateRequest) field.ErrorList {
+	op := operation.Operation{Type: operation.Create}
+	return Validate_ReportActorSnapshotStateRequest(ctx, op, nil, req, nil)
 }
 
 // validateWorkerUpdate validates a Worker against the previous stored value.

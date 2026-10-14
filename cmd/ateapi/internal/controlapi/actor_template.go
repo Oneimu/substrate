@@ -105,7 +105,7 @@ func (s *RPCService) ListActorTemplates(ctx context.Context, req *ateapipb.ListA
 		return nil, resources.ToAPIError(errs)
 	}
 
-	page, err := s.impl.ListActorTemplates(ctx, req.GetAtespace(), store.ListOptions{PageSize: effectivePageSize(req.GetPageSize()), PageToken: req.GetPageToken()})
+	page, err := s.impl.ListActorTemplates(ctx, req.GetAtespace(), toStoreListOptions(req.GetOptions()))
 	if err != nil {
 		return nil, mapListError(fmt.Errorf("while listing actor templates in db: %w", err))
 	}
@@ -164,14 +164,4 @@ func resolveActorTemplate(ctx context.Context, st actorTemplateGetter, actor *at
 		return nil, fmt.Errorf("while getting ActorTemplate: %w", err)
 	}
 	return template, nil
-}
-
-// actorTemplateObjectRef returns a fresh copy of the actor's template
-// reference — fresh so records built from it never alias the actor message.
-func actorTemplateObjectRef(actor *ateapipb.Actor) *ateapipb.ObjectRef {
-	ref := actor.GetActorTemplate()
-	if ref == nil {
-		return nil
-	}
-	return &ateapipb.ObjectRef{Atespace: ref.GetAtespace(), Name: ref.GetName()}
 }

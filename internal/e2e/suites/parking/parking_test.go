@@ -172,7 +172,7 @@ func TestRequestParking(t *testing.T) {
 		if resp.StatusCode != wantStatus {
 			t.Fatalf("status = %d (body %q), want %d", resp.StatusCode, string(body), wantStatus)
 		}
-		if wantStatus == http.StatusServiceUnavailable && !strings.Contains(string(body), "no free workers available") {
+		if wantStatus == http.StatusServiceUnavailable && !strings.Contains(string(body), "no worker has room for the actor") {
 			t.Errorf("body = %q, want the router's capacity verdict", string(body))
 		}
 		if wantStatus == http.StatusServiceUnavailable {
@@ -206,7 +206,7 @@ func deployParkingFixture(t *testing.T, ctx context.Context, clients *e2e.Client
 	_, templates := e2e.DeploySubstrateFixture(t, ctx, clients, e2e.SubstrateFixtureManifests{
 		Pool:     "internal/e2e/fixtures/probe/probe-parking.yaml.tmpl",
 		Template: "internal/e2e/fixtures/probe/probe-parking-template.yaml.tmpl",
-	}, env["BUCKET_NAME"], "parking", false)
+	}, env["BUCKET_NAME"], "parking", nil)
 	return templates[0]
 }
 

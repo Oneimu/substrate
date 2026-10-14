@@ -30,6 +30,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/utils/ptr"
 
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/ateletpath"
 	"github.com/agent-substrate/substrate/internal/imagecache"
@@ -72,13 +73,17 @@ func gvisorConfig(name, url, sha string) *v1alpha1.SandboxConfig {
 	return &v1alpha1.SandboxConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: v1alpha1.SandboxConfigSpec{
-			SandboxClass: v1alpha1.SandboxClassGvisor,
-			PauseImage:   "registry.k8s.io/pause@sha256:abc",
-			Assets: map[string]map[string]v1alpha1.AssetFile{
-				runtime.GOARCH: {
-					runscAssetName: {URL: url, SHA256: sha},
+			SandboxClass:   v1alpha1.SandboxClassGvisor,
+			DefaultVersion: "v1",
+			Versions: []v1alpha1.SandboxVersionConfig{{
+				Name:       "v1",
+				PauseImage: "registry.k8s.io/pause@sha256:abc",
+				Assets: map[string]map[string]v1alpha1.AssetFile{
+					runtime.GOARCH: {
+						runscAssetName: {URL: url, SHA256: sha},
+					},
 				},
-			},
+			}},
 		},
 	}
 }
@@ -87,15 +92,15 @@ func TestRecordFromSandboxConfig(t *testing.T) {
 	sha := fmt.Sprintf("%x", sha256.Sum256([]byte("runsc")))
 	cfg := gvisorConfig("gvisor-default", "gs://bucket/runsc", sha)
 
-	rec, err := recordFromSandboxConfig(cfg)
+	rec, err := recordFromSandboxConfig(cfg, &cfg.Spec.Versions[0])
 	if err != nil {
 		t.Fatalf("recordFromSandboxConfig: %v", err)
 	}
 	if rec.SandboxClass != string(v1alpha1.SandboxClassGvisor) {
 		t.Errorf("SandboxClass = %q, want %q", rec.SandboxClass, v1alpha1.SandboxClassGvisor)
 	}
-	if rec.PauseImage != cfg.Spec.PauseImage {
-		t.Errorf("PauseImage = %q, want %q", rec.PauseImage, cfg.Spec.PauseImage)
+	if rec.PauseImage != cfg.Spec.Versions[0].PauseImage {
+		t.Errorf("PauseImage = %q, want %q", rec.PauseImage, cfg.Spec.Versions[0].PauseImage)
 	}
 	want := assetEntry{URL: "gs://bucket/runsc", SHA256: sha}
 	if got := rec.Assets[runscAssetName]; got != want {
@@ -105,10 +110,10 @@ func TestRecordFromSandboxConfig(t *testing.T) {
 	// A config with no assets for this node's architecture cannot be
 	// projected, and the error carries the sentinel that keeps prewarm from
 	// retrying a condition only a config change can clear.
-	cfg.Spec.Assets = map[string]map[string]v1alpha1.AssetFile{
+	cfg.Spec.Versions[0].Assets = map[string]map[string]v1alpha1.AssetFile{
 		"other-arch": {runscAssetName: {URL: "gs://bucket/runsc", SHA256: sha}},
 	}
-	if _, err := recordFromSandboxConfig(cfg); !errors.Is(err, errNoAssetsForArch) {
+	if _, err := recordFromSandboxConfig(cfg, &cfg.Spec.Versions[0]); !errors.Is(err, errNoAssetsForArch) {
 		t.Errorf("recordFromSandboxConfig with no assets for the local architecture = %v, want errNoAssetsForArch", err)
 	}
 }
@@ -170,7 +175,7 @@ func TestPrewarmProcessRetries(t *testing.T) {
 	ctx := context.Background()
 	cfg := gvisorConfig("gvisor-default", "gs://bucket/runsc", fmt.Sprintf("%x", sha256.Sum256([]byte("runsc"))))
 	// No pause image, so a failing prewarm exercises only the asset path.
-	cfg.Spec.PauseImage = ""
+	cfg.Spec.Versions[0].PauseImage = ""
 
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	if err := indexer.Add(cfg); err != nil {
@@ -268,7 +273,7 @@ func TestPrewarmPauseImage(t *testing.T) {
 	ctx := context.Background()
 	content := []byte("runsc binary bytes")
 	cfg := gvisorConfig("gvisor-default", "gs://bucket/runsc", fmt.Sprintf("%x", sha256.Sum256(content)))
-	cfg.Spec.PauseImage = pauseRef
+	cfg.Spec.Versions[0].PauseImage = pauseRef
 
 	p := &sandboxPrewarmer{
 		assets: &AteomHerder{anonGCSClient: fakeObjectStorage{data: content}},
@@ -282,7 +287,7 @@ func TestPrewarmPauseImage(t *testing.T) {
 	// failing object storage is actually consulted — and must not keep the
 	// pause image from being pulled.
 	failCfg := gvisorConfig("gvisor-default", "gs://bucket/runsc", fmt.Sprintf("%x", sha256.Sum256([]byte("other runsc"))))
-	failCfg.Spec.PauseImage = pauseRef
+	failCfg.Spec.Versions[0].PauseImage = pauseRef
 	p = &sandboxPrewarmer{
 		assets: &AteomHerder{anonGCSClient: fakeObjectStorage{err: errors.New("bucket unavailable")}},
 		images: failStore,
@@ -295,10 +300,10 @@ func TestPrewarmPauseImage(t *testing.T) {
 	// pause image pulled, and prewarm succeeds: the missing assets are
 	// permanent until the config changes, not a retryable failure.
 	archCfg := gvisorConfig("gvisor-default", "gs://bucket/runsc", fmt.Sprintf("%x", sha256.Sum256(content)))
-	archCfg.Spec.Assets = map[string]map[string]v1alpha1.AssetFile{
-		"other-arch": {runscAssetName: archCfg.Spec.Assets[runtime.GOARCH][runscAssetName]},
+	archCfg.Spec.Versions[0].Assets = map[string]map[string]v1alpha1.AssetFile{
+		"other-arch": {runscAssetName: archCfg.Spec.Versions[0].Assets[runtime.GOARCH][runscAssetName]},
 	}
-	archCfg.Spec.PauseImage = pauseRef
+	archCfg.Spec.Versions[0].PauseImage = pauseRef
 	p = &sandboxPrewarmer{images: archStore}
 	if err := p.prewarm(ctx, archCfg); err != nil {
 		t.Errorf("prewarm with no assets for the local architecture: %v", err)
@@ -335,7 +340,7 @@ func TestPrewarmTimeout(t *testing.T) {
 	t.Cleanup(func() { nodepath.StaticFilesDir, prewarmTimeout = origDir, origTimeout })
 
 	cfg := gvisorConfig("gvisor-default", "gs://bucket/runsc", fmt.Sprintf("%x", sha256.Sum256([]byte("hung runsc"))))
-	cfg.Spec.PauseImage = ""
+	cfg.Spec.Versions[0].PauseImage = ""
 	p := &sandboxPrewarmer{assets: &AteomHerder{anonGCSClient: hangingObjectStorage{}}}
 
 	done := make(chan error, 1)
@@ -350,14 +355,73 @@ func TestPrewarmTimeout(t *testing.T) {
 	}
 }
 
+// TestPrewarmDefaultVersionOnly verifies prewarm fetches only the version
+// defaultVersion names, and that a config without its default version, or
+// whose default version is Disabled, is nothing to do rather than a retryable
+// failure.
+func TestPrewarmDefaultVersionOnly(t *testing.T) {
+	origDir := nodepath.StaticFilesDir
+	nodepath.StaticFilesDir = t.TempDir()
+	t.Cleanup(func() { nodepath.StaticFilesDir = origDir })
+
+	ctx := context.Background()
+	content := []byte("runsc binary bytes")
+	cfg := gvisorConfig("gvisor-default", "gs://bucket/runsc", fmt.Sprintf("%x", sha256.Sum256(content)))
+	cfg.Spec.Versions[0].PauseImage = ""
+	// A non-default version whose asset the fake bucket cannot serve: fetching
+	// it would fail the hash check.
+	otherSHA := fmt.Sprintf("%x", sha256.Sum256([]byte("other runsc")))
+	cfg.Spec.Versions = append([]v1alpha1.SandboxVersionConfig{{
+		Name:   "v0",
+		Assets: map[string]map[string]v1alpha1.AssetFile{runtime.GOARCH: {runscAssetName: {URL: "gs://bucket/other-runsc", SHA256: otherSHA}}},
+	}}, cfg.Spec.Versions...)
+
+	p := &sandboxPrewarmer{assets: &AteomHerder{anonGCSClient: fakeObjectStorage{data: content}}}
+	if err := p.prewarm(ctx, cfg); err != nil {
+		t.Fatalf("prewarm: %v", err)
+	}
+	if _, err := os.Stat(ateletpath.AssetPath(otherSHA)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("non-default version asset was prewarmed (stat err = %v)", err)
+	}
+
+	// Any fetch would fail, so a nil error means nothing was attempted.
+	cfg.Spec.DefaultVersion = "missing"
+	p = &sandboxPrewarmer{assets: &AteomHerder{anonGCSClient: fakeObjectStorage{err: errors.New("bucket unavailable")}}}
+	if err := p.prewarm(ctx, cfg); err != nil {
+		t.Errorf("prewarm of a config without its default version: %v", err)
+	}
+
+	cfg.Spec.DefaultVersion = "v0"
+	cfg.Spec.Versions[0].State = ptr.To(v1alpha1.SandboxVersionStateDisabled)
+	if err := p.prewarm(ctx, cfg); err != nil {
+		t.Errorf("prewarm of a config whose default version is Disabled: %v", err)
+	}
+}
+
 // TestSandboxAssetPrewarmDownloads runs the whole path: a SandboxConfig in a
 // fake clientset flows through the informer into the prewarm worker, which
 // lands the asset in the static-files cache without any Run/Restore request.
 func TestSandboxAssetPrewarmDownloads(t *testing.T) {
-	origDir, origJitter := nodepath.StaticFilesDir, prewarmMaxJitter
+	origDir, origJitter, origFinished := nodepath.StaticFilesDir, prewarmMaxJitter, prewarmFinished
 	nodepath.StaticFilesDir = t.TempDir()
 	prewarmMaxJitter = 0
-	t.Cleanup(func() { nodepath.StaticFilesDir, prewarmMaxJitter = origDir, origJitter })
+	// The worker's own prewarm call returns only when the asset has landed
+	// and the pause-image pull has finished: it waits for the pull on a live
+	// context, while the pull runs detached from that context (see
+	// imagecache.Store.EnsureImage). Waiting for the call keeps the pull's
+	// last writes from racing the TempDir cleanup.
+	prewarmed := make(chan error, 1)
+	prewarmFinished = func(_ string, err error) {
+		// Non-blocking: a failed attempt is retried, and the worker must not
+		// block on a result nobody reads.
+		select {
+		case prewarmed <- err:
+		default:
+		}
+	}
+	t.Cleanup(func() {
+		nodepath.StaticFilesDir, prewarmMaxJitter, prewarmFinished = origDir, origJitter, origFinished
+	})
 
 	host := imageVolumeTestRegistry(t)
 	pauseRef := host + "/pause:3.10"
@@ -366,7 +430,7 @@ func TestSandboxAssetPrewarmDownloads(t *testing.T) {
 	content := []byte("runsc binary bytes")
 	sha := fmt.Sprintf("%x", sha256.Sum256(content))
 	cfg := gvisorConfig("gvisor-default", "gs://bucket/runsc", sha)
-	cfg.Spec.PauseImage = pauseRef
+	cfg.Spec.Versions[0].PauseImage = pauseRef
 
 	ctx := t.Context()
 	client := fake.NewSimpleClientset(cfg)
@@ -381,24 +445,30 @@ func TestSandboxAssetPrewarmDownloads(t *testing.T) {
 	// Handler first, informer start second, mirroring main: atelet startup
 	// must never wait on this informer's sync, and the initial List replays
 	// the pre-existing config into the handler as an Add.
-	if err := startSandboxAssetPrewarm(ctx, informer, herder, store, false); err != nil {
+	p, err := startSandboxAssetPrewarm(ctx, informer, herder, store, false)
+	if err != nil {
 		t.Fatalf("startSandboxAssetPrewarm: %v", err)
 	}
+	// The worker reads the patched globals above. t.Context() is canceled
+	// before cleanups run, and cleanups run last-registered-first, so this
+	// joins the worker before the earlier cleanup restores the globals —
+	// without it the restore races the worker's tail (pause-image pull
+	// after the asset lands) and trips the race detector.
+	t.Cleanup(p.wait)
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 	factory.Start(stopCh)
 
-	wantPath := ateletpath.RunSCBinaryPath(sha)
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if _, err := os.Stat(wantPath); err == nil {
-			return
-		} else if !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("stat %s: %v", wantPath, err)
+	select {
+	case err := <-prewarmed:
+		if err != nil {
+			t.Fatalf("prewarm: %v", err)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("asset never prewarmed to %s", wantPath)
-		}
-		time.Sleep(10 * time.Millisecond)
+	case <-time.After(30 * time.Second):
+		t.Fatal("prewarm never finished")
+	}
+	wantPath := ateletpath.AssetPath(sha)
+	if _, err := os.Stat(wantPath); err != nil {
+		t.Fatalf("asset not prewarmed to %s: %v", wantPath, err)
 	}
 }

@@ -18,9 +18,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/grpc/codes"
 
 	"github.com/agent-substrate/substrate/internal/actorlock"
@@ -34,88 +39,192 @@ var testActorDirs = &ateompb.ActorDirs{
 	OciBundleDir: "/node/actors/test-actor-123/bundle",
 }
 
-func TestKillArgs(t *testing.T) {
+// writeSpec builds a workload container's spec from the request and the pause
+// container's from ateom's own description.
+func TestWriteSpec(t *testing.T) {
+	root := t.TempDir()
+	actorDirs := &ateompb.ActorDirs{RootDir: root, OciBundleDir: filepath.Join(root, "bundles")}
 	r := &runsc{
-		path:      "/usr/bin/runsc",
-		actorUID:  "test-actor-123",
-		actorDirs: testActorDirs,
+		actorUID:   "uid-a",
+		actorDirs:  actorDirs,
+		containers: []*ateompb.Container{{Name: "app", ContainerSpec: &ateompb.ContainerSpec{Args: []string{"/app", "serve"}}}},
 	}
-
-	got := r.killArgs("my-container", "SIGTERM")
-	want := []string{
-		"-log-format", "json",
-		"--alsologtostderr",
-		"-root", "/node/actors/test-actor-123/runsc-state",
-		"kill",
-		"my-container",
-		"SIGTERM",
+	for name, wantArgs := range map[string][]string{
+		"app":                  {"/app", "serve"},
+		ocispec.PauseContainer: {"/pause"},
+	} {
+		bundle := ociBundlePath(actorDirs, name)
+		if err := os.MkdirAll(bundle, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.writeSpec(name); err != nil {
+			t.Fatalf("writeSpec(%q) = %v", name, err)
+		}
+		b, err := os.ReadFile(filepath.Join(bundle, "config.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var spec specs.Spec
+		if err := json.Unmarshal(b, &spec); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(spec.Process.Args, wantArgs) {
+			t.Errorf("%s args = %v, want %v", name, spec.Process.Args, wantArgs)
+		}
+		if got := spec.Annotations["io.kubernetes.cri.container-name"]; got != name {
+			t.Errorf("%s container-name annotation = %q, want the spec shaped for gVisor", name, got)
+		}
+		if name == ocispec.PauseContainer && len(spec.Process.Capabilities.Bounding) != 0 {
+			t.Errorf("pause capabilities = %v, want none", spec.Process.Capabilities.Bounding)
+		}
 	}
-
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("killArgs() = %v, want %v", got, want)
+	if err := r.writeSpec("missing"); err == nil {
+		t.Error("writeSpec() = nil for a container outside the workload spec")
 	}
 }
 
-func TestWaitArgs(t *testing.T) {
+func mustFlagStore(t *testing.T) *flagStore {
+	t.Helper()
+	cfgPath := filepath.Join(t.TempDir(), "flags.json")
+	const testFlagsJSON = `{
+  "globalFlags": [
+    "-global1",
+    "-global2"
+  ],
+  "commands": {
+    "restore": {
+      "globalFlags": ["-restore-global"],
+      "subcommandFlags": ["-restore-sub1", "-restore-sub2"]
+    },
+    "start": {
+      "globalFlags": ["-start-global"]
+    },
+    "list": {
+      "subcommandFlags": ["-list-sub"]
+    }
+  }
+}`
+	if err := os.WriteFile(cfgPath, []byte(testFlagsJSON), 0o600); err != nil {
+		t.Fatalf("failed to write test flags.json: %v", err)
+	}
+	store, err := newFlagStore(t.Context(), cfgPath)
+	if err != nil {
+		t.Fatalf("newFlagStore(%s) failed: %v", cfgPath, err)
+	}
+	return store
+}
+
+func TestBuildArgs(t *testing.T) {
 	r := &runsc{
 		path:      "/usr/bin/runsc",
 		actorUID:  "test-actor-123",
 		actorDirs: testActorDirs,
+		flags:     mustFlagStore(t),
 	}
 
-	got := r.waitArgs("my-container")
-	want := []string{
-		"-log-format", "json",
-		"--alsologtostderr",
-		"-root", "/node/actors/test-actor-123/runsc-state",
-		"wait",
-		"my-container",
-	}
-
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("waitArgs() = %v, want %v", got, want)
+	for _, tc := range []struct {
+		name          string
+		command       string
+		containerName string
+		extraArgs     []string
+		want          []string
+	}{
+		{
+			name:          "kill",
+			command:       "kill",
+			containerName: "",
+			extraArgs:     []string{"my-container", "SIGTERM"},
+			want: []string{
+				"-global1",
+				"-global2",
+				"-root", "/node/actors/test-actor-123/runsc-state",
+				"kill",
+				"my-container",
+				"SIGTERM",
+			},
+		},
+		{
+			name:          "wait",
+			command:       "wait",
+			containerName: "my-container",
+			want: []string{
+				"-global1",
+				"-global2",
+				"-root", "/node/actors/test-actor-123/runsc-state",
+				"wait",
+				"my-container",
+			},
+		},
+		{
+			name:          "list",
+			command:       "list",
+			containerName: "",
+			want: []string{
+				"-global1",
+				"-global2",
+				"-root", "/node/actors/test-actor-123/runsc-state",
+				"list",
+				"-list-sub",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := r.buildArgs(tc.command, tc.containerName, tc.extraArgs...)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("buildArgs(%q, %q, %v) = %v, want %v", tc.command, tc.containerName, tc.extraArgs, got, tc.want)
+			}
+		})
 	}
 }
 
-func TestPauseArgs(t *testing.T) {
+func TestCheckpointArgs(t *testing.T) {
 	r := &runsc{
 		path:      "/usr/bin/runsc",
 		actorUID:  "test-actor-123",
 		actorDirs: testActorDirs,
+		flags:     mustFlagStore(t),
 	}
+	checkpointDir := "/node/actors/test-actor-123/checkpoints/snap-1"
 
-	got := r.pauseArgs(ocispec.PauseContainer)
+	got := r.checkpointArgs(ocispec.PauseContainer, checkpointDir, []string{"app:/var/data", "app:/var/cache"})
 	want := []string{
-		"-log-format", "json",
-		"--alsologtostderr",
+		"-global1",
+		"-global2",
 		"-root", "/node/actors/test-actor-123/runsc-state",
-		"pause",
+		"checkpoint",
+		"-image-path", checkpointDir,
+		"-fs-checkpoint-paths", "app:/var/data,app:/var/cache",
 		ocispec.PauseContainer,
 	}
 
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("pauseArgs() = %v, want %v", got, want)
+		t.Errorf("checkpointArgs() = %v, want %v", got, want)
 	}
 }
 
-func TestResumeArgs(t *testing.T) {
+func TestFsCheckpointArgs(t *testing.T) {
 	r := &runsc{
 		path:      "/usr/bin/runsc",
 		actorUID:  "test-actor-123",
 		actorDirs: testActorDirs,
+		flags:     mustFlagStore(t),
 	}
+	checkpointDir := "/node/actors/test-actor-123/checkpoints/snap-1"
 
-	got := r.resumeArgs(ocispec.PauseContainer)
+	got := r.fsCheckpointArgs(ocispec.PauseContainer, checkpointDir, []string{"app:/var/data", "app:/var/cache"})
 	want := []string{
-		"-log-format", "json",
-		"--alsologtostderr",
+		"-global1",
+		"-global2",
 		"-root", "/node/actors/test-actor-123/runsc-state",
-		"resume",
+		"fscheckpoint",
+		"-image-path", filepath.Join(checkpointDir, "fs"),
+		"-path", "app:/var/data",
+		"-path", "app:/var/cache",
 		ocispec.PauseContainer,
 	}
 
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("resumeArgs() = %v, want %v", got, want)
+		t.Errorf("fsCheckpointArgs() = %v, want %v", got, want)
 	}
 }
 
@@ -124,21 +233,22 @@ func TestRestoreArgs(t *testing.T) {
 		path:      "/usr/bin/runsc",
 		actorUID:  "test-actor-123",
 		actorDirs: testActorDirs,
+		flags:     mustFlagStore(t),
 	}
 	checkpointDir := "/node/actors/test-actor-123/checkpoints/snap-1"
 
 	got := r.restoreArgs(ocispec.PauseContainer, checkpointDir)
 	want := []string{
-		"-log-format", "json",
-		"--alsologtostderr",
+		"-global1",
+		"-global2",
+		"-restore-global",
 		"-root", "/node/actors/test-actor-123/runsc-state",
-		"--cpu-num-from-quota",
 		"restore",
+		"-restore-sub1",
+		"-restore-sub2",
 		"-bundle", "/node/actors/test-actor-123/bundle/" + ocispec.PauseContainer,
 		"-image-path", checkpointDir,
 		"-pid-file", "/node/actors/test-actor-123/pidfiles/" + ocispec.PauseContainer + ".pid",
-		"-background",
-		"-detach",
 		ocispec.PauseContainer,
 	}
 

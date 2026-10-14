@@ -18,6 +18,7 @@
 package demotest
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -31,14 +32,25 @@ import (
 // configuration, so they can be exercised without a kubeconfig.
 func Env(t *testing.T) *steps.Env {
 	t.Helper()
-	// Pin VERSION so rendering does not depend on whatever tags (e.g.
-	// archive/*) happen to be in the local git checkout.
-	t.Setenv("VERSION", "v0.0.0-test")
 	root, err := config.RepoRoot()
 	if err != nil {
 		t.Fatalf("RepoRoot: %v", err)
 	}
-	return &steps.Env{Cfg: &config.Config{Root: root, BucketName: "ate-snapshots"}}
+	// Resolve from the process environment so a test can steer a demo's own
+	// settings with t.Setenv, the way an operator would with an export.
+	env := map[string]string{}
+	for _, kv := range os.Environ() {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			env[k] = v
+		}
+	}
+	r, err := config.Resolve(nil, config.ResolveOptions{Env: env})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	cfg := &config.Config{Root: root, BucketName: "ate-snapshots"}
+	cfg.SetResolved(r)
+	return &steps.Env{Cfg: cfg}
 }
 
 // AssertRendered checks that every placeholder in a rendered template was

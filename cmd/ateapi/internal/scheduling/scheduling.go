@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"slices"
 
+	"github.com/agent-substrate/substrate/internal/hardware"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"k8s.io/apimachinery/pkg/labels"
@@ -32,6 +33,11 @@ type Constraints struct {
 	// SandboxClass must equal the worker's sandbox class. Snapshots are not
 	// portable across sandbox classes, so this is never relaxed.
 	SandboxClass string
+
+	// RequiredRuntime, when non-nil, restricts placement to workers whose
+	// DefaultRuntime or RestorableRuntimes can restore a snapshot stamped with
+	// this runtime.
+	RequiredRuntime *ateapipb.SandboxRuntime
 
 	// TemplateSelector and ActorSelector must both match the worker's labels.
 	TemplateSelector labels.Selector
@@ -47,14 +53,15 @@ type Constraints struct {
 	Limits *ateapipb.Resources
 }
 
-// ErrNoCapacity is returned by Schedule when no free worker satisfies the
-// constraints.
-var ErrNoCapacity = errors.New("no free workers satisfy the constraints")
+// ErrNoCapacity is returned by Schedule when no worker that meets the
+// constraints has room. The cause can be full workers, or no worker that meets
+// the constraints at all.
+var ErrNoCapacity = errors.New("no worker that meets the constraints has room")
 
 // Scheduler answers placement questions against the current worker fleet.
 type Scheduler interface {
-	// Schedule returns a free worker satisfying constraints.
-	// Returns ErrNoCapacity when no free worker satisfies the requested constraints.
+	// Schedule returns a worker that meets constraints and has room.
+	// Returns ErrNoCapacity when no worker that meets constraints has room.
 	Schedule(ctx context.Context, constraints Constraints) (*ateapipb.Worker, error)
 
 	// Applies reports whether worker satisfies non-capacity constraints. Capacity
@@ -224,15 +231,19 @@ func (s *scheduler) Applies(worker *ateapipb.Worker, constraints Constraints) bo
 		return false
 	}
 
+	if len(constraints.RequiredNodes) > 0 && !slices.Contains(constraints.RequiredNodes, worker.GetNodeName()) {
+		return false
+	}
+
+	if !hardware.WorkerMatches(worker.GetStatus(), constraints.RequiredRuntime) {
+		return false
+	}
+
 	set := labels.Set(worker.GetLabels())
 	if constraints.TemplateSelector != nil && !constraints.TemplateSelector.Matches(set) {
 		return false
 	}
-	if constraints.ActorSelector != nil && !constraints.ActorSelector.Matches(set) {
-		return false
-	}
-
-	return len(constraints.RequiredNodes) == 0 || slices.Contains(constraints.RequiredNodes, worker.GetNodeName())
+	return constraints.ActorSelector == nil || constraints.ActorSelector.Matches(set)
 }
 
 // HasRoom reports whether what the worker has left admits one more actor of

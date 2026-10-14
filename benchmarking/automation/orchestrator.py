@@ -53,7 +53,14 @@ from typing import Any
 import yaml
 
 from testtypes import TYPES
-from util import parse_duration_seconds, run, run_no_check
+from util import (
+    isolate_block,
+    isolate_install_args,
+    isolate_workload_args,
+    parse_duration_seconds,
+    run,
+    run_no_check,
+)
 
 
 SUBSTRATE_DIR = "/workspace/substrate"
@@ -198,6 +205,22 @@ def sanitize(name: str) -> str:
     return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
 
 
+# Kubernetes copies a Job's name into the job-name label on the Job and its
+# pods, and a label value holds at most 63 bytes.
+MAX_JOB_NAME_LEN = 63
+
+
+def job_name(name: str, commit: str) -> str:
+    """Return a unique Job name for a test run that fits a Kubernetes label.
+
+    The commit and random suffix always survive; a long test name is cut to
+    make room, so two runs of the same test never collide.
+    """
+    suffix = f"-{commit[:7]}-{uuid.uuid4().hex[:6]}"
+    prefix = f"runner-{sanitize(name)}"
+    return prefix[: MAX_JOB_NAME_LEN - len(suffix)].rstrip("-") + suffix
+
+
 def render_template(path: str, subs: dict[str, Any], extra_args: Iterable[str] = ()) -> str:
     text = Path(path).read_text()
     for k, v in subs.items():
@@ -303,6 +326,15 @@ def validate_and_normalize_tests(tests: list[dict[str, Any]]) -> None:
                 f"(want one of {list(TEST_TYPES)})"
             )
         TYPES[ttype].validate(t)
+        isolate_block(t)
+
+
+def substrate_args(test: dict[str, Any]) -> list[str]:
+    """Return the hack/install-ate.sh --deploy-ate-system arguments for a
+    tests.yaml entry: its ateArgs, then the fake data plane flag its isolate
+    block asks for. The teardown needs no matching flag: --delete-ate-system
+    removes the fake data plane whether or not it was installed."""
+    return [*test.get("ateArgs", []), *isolate_install_args(test)]
 
 
 def deploy_substrate(ate_args: Iterable[str] = ()) -> None:
@@ -333,6 +365,7 @@ def deploy_workloads(
     actor_memory: str = "",
     wait_timeout_secs: int | str = "",
     worker_memory: str = "",
+    fake_atelet_args: Iterable[str] = (),
 ) -> None:
     cmd = [
         "benchmarking/workloads/deploy.sh",
@@ -354,6 +387,8 @@ def deploy_workloads(
     # (whole seconds).
     if wait_timeout_secs != "":
         cmd += ["--wait-timeout", str(wait_timeout_secs)]
+    # An isolate block's tuning of fake-atelet, on the fake data plane.
+    cmd += list(fake_atelet_args)
     # deploy.sh itself blocks until every template's golden snapshot exists.
     run(cmd)
 
@@ -370,9 +405,9 @@ def run_test(
     manifests_dir: str = MANIFESTS_DIR,
 ) -> str:
     name = test["name"]
-    job_name = f"runner-{sanitize(name)}-{commit[:7]}-{uuid.uuid4().hex[:6]}"
+    job = job_name(name, commit)
     subs = {
-        "JOB_NAME": job_name,
+        "JOB_NAME": job,
         "IMAGE": image,
         "TAG": commit,
         "NAME": name,
@@ -383,17 +418,17 @@ def run_test(
     subs.update(mod.job_subs(test))
     manifest = render_template(tmpl, subs, test.get("flags", []))
     wait_for_no_active_runners()
-    print(f"Submitting Job {job_name}", flush=True)
+    print(f"Submitting Job {job}", flush=True)
     subprocess.run(
         ["kubectl", "apply", "-f", "-"], input=manifest, text=True, check=True
     )
     timeout = parse_duration_seconds(test["duration"]) + 1800
-    result = wait_for_job(job_name, timeout)
-    print(f"Job {job_name} result: {result}", flush=True)
+    result = wait_for_job(job, timeout)
+    print(f"Job {job} result: {result}", flush=True)
     run_no_check(
-        ["kubectl", "logs", f"job/{job_name}", "-n", NAMESPACE, "--tail=500"]
+        ["kubectl", "logs", f"job/{job}", "-n", NAMESPACE, "--tail=500"]
     )
-    run_no_check(["kubectl", "delete", "job", job_name, "-n", NAMESPACE])
+    run_no_check(["kubectl", "delete", "job", job, "-n", NAMESPACE])
     return result
 
 
@@ -518,7 +553,7 @@ def main() -> None:
             failure_msg = None
             start_time = time.time()
             try:
-                deploy_substrate(test.get("ateArgs", []))
+                deploy_substrate(substrate_args(test))
                 TYPES[ttype].pre_test(test)
                 # install-microvm-deps needs the CRDs from deploy_substrate;
                 # deploy_workloads needs the microvm SandboxConfig.
@@ -530,6 +565,7 @@ def main() -> None:
                     test.get("actorMemory", ""),
                     test.get("workerWaitTimeout", ""),
                     test.get("workerMemory", ""),
+                    isolate_workload_args(test),
                 )
                 try:
                     status = run_test(

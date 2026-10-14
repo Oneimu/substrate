@@ -25,17 +25,26 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/apierror"
 	"github.com/agent-substrate/substrate/internal/ateattr"
-	"github.com/agent-substrate/substrate/internal/objectstore"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"go.opentelemetry.io/otel/attribute"
 )
 
-// revertableStates are the states a revert is accepted from.
+// revertableStates are the states a revert is accepted from. A SUSPENDED
+// actor is also accepted when it is paused, that is, when its latest snapshot
+// is node-local: the revert discards that snapshot and returns the actor to
+// its durable one. See isRevertable.
 var revertableStates = []ateapipb.ActorState{
 	ateapipb.ActorState_ACTOR_STATE_RUNNING,
-	ateapipb.ActorState_ACTOR_STATE_PAUSED,
 	ateapipb.ActorState_ACTOR_STATE_CRASHED,
+}
+
+// isRevertable reports whether a revert is accepted from the actor's current
+// state and snapshot shape.
+func isRevertable(actor *ateapipb.Actor) bool {
+	state := actor.GetStatus().GetState()
+	return slices.Contains(revertableStates, state) ||
+		(state == ateapipb.ActorState_ACTOR_STATE_SUSPENDED && latestSnapshotIsLocalOnly(actor.GetStatus()))
 }
 
 // RevertActor executes the workflow to discard an actor's current execution and
@@ -139,8 +148,8 @@ func (w *ActorWorkflow) ensureMarkedReverting(ctx context.Context, actorRef reso
 		markSkipped(ctx, "actor already REVERTING")
 		return actor, nil
 	}
-	if !slices.Contains(revertableStates, st) {
-		return nil, apierror.FailedPrecondition("Actor %s is not in a revertable state (got: %v, want one of %v)", actorRef, st, revertableStates)
+	if !isRevertable(actor) {
+		return nil, apierror.FailedPrecondition("Actor %s is not in a revertable state (got: %v, want one of %v, or %s with a node-local snapshot)", actorRef, st, revertableStates, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
 	}
 
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(actor), func(toUpdate *ateapipb.Actor) error {
@@ -173,22 +182,18 @@ func (w *ActorWorkflow) ensureWorkerDiscarded(ctx context.Context, actorRef reso
 	ctx, done := stepSpan(ctx, "DiscardWorker")
 	defer func() { err = done(err) }()
 
-	if assignment := actor.GetStatus().GetWorkerAssignment(); assignment != nil {
-		hosted, err := workerHostsActor(ctx, w.store, assignment.GetWorker().GetName(), actor.GetMetadata().GetUid())
-		if err != nil {
+	if actor.GetStatus().GetAssignedNode() != "" {
+		if err := w.ensureAteletTerminated(ctx, actorRef, actor, actorTemplate, ateattr.OperationRevert); err != nil {
+			// A failed terminate leaves the actor REVERTING with its
+			// assignment, so the next revert terminates it again. If the
+			// worker's pod goes away, worker deletion crashes the actor, and
+			// the next revert needs no live worker.
 			return err
 		}
-		if hosted {
-			if err := w.ensureAteletTerminated(ctx, actorRef, actor, actorTemplate, ateattr.OperationRevert); err != nil {
-				// A failed terminate leaves the actor REVERTING with its
-				// assignment, so the next revert terminates it again. If the
-				// worker's pod goes away, worker deletion crashes the actor, and
-				// the next revert needs no live worker.
-				return err
-			}
-			if err := w.ensureVolumesDetached(ctx, actor, actorTemplate, "DetachVolumesForRevert", ateattr.OperationRevert); err != nil {
-				return err
-			}
+		if err := w.ensureVolumesDetached(ctx, actor, actorTemplate, "DetachVolumesForRevert", ateattr.OperationRevert); err != nil {
+			return err
+		}
+		if actor.GetStatus().GetWorkerAssignment() != nil {
 			if _, _, err := releaseWorker(ctx, w.store, actor); err != nil {
 				return fmt.Errorf("while releasing worker: %w", err)
 			}
@@ -204,9 +209,10 @@ func (w *ActorWorkflow) ensureInProgressSnapshotDiscarded(ctx context.Context, a
 	ctx, done := stepSpan(ctx, "DiscardInProgressSnapshot")
 	defer func() { err = done(err) }()
 
-	inProgress := actor.GetStatus().GetInProgressSnapshotUri()
+	inProgressSnap := findLatestDurableSnapshot(actor.GetStatus(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING)
+	inProgress := inProgressSnap.GetDurableSnapshot().GetObject().GetSnapshotUri()
 	switch {
-	case w.objectStore == nil:
+	case w.objectStorePlugin == nil:
 		markSkipped(ctx, "no object store configured")
 		return nil
 	case inProgress == "":
@@ -227,7 +233,7 @@ func (w *ActorWorkflow) ensureInProgressSnapshotDiscarded(ctx context.Context, a
 	}
 	// Only the abandoned snapshot goes, not the actor's whole prefix: the
 	// external snapshot the revert returns the actor to lives under it too.
-	return objectstore.DeletePrefix(ctx, w.objectStore, uri.Prefix())
+	return w.cleanupSnapshot(ctx, uri.Prefix())
 }
 
 // ensureRevertedFinalized commits SUSPENDED and drops every pointer to the
@@ -249,9 +255,14 @@ func (w *ActorWorkflow) ensureRevertedFinalized(ctx context.Context, actorRef re
 	storedActor, err := w.store.UpdateActor(ctx, actorRef, store.PreconditionFrom(latestActor), func(toUpdate *ateapipb.Actor) error {
 		toUpdate.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
 		toUpdate.Status.WorkerAssignment = nil
-		toUpdate.Status.InProgressSnapshotUri = ""
-		toUpdate.Status.InProgressLocalSnapshotName = ""
-		toUpdate.Status.LocalSnapshot = nil
+		toUpdate.Status.AssignedNode = ""
+		// We revert back to the latest durable snapshot, so all local snapshots
+		// and pending durable snapshots are removed.
+		// We already cleaned up the node before this in ensureWorkerDiscarded,
+		// and any in-progress durable snapshot in ensureInProgressSnapshotDiscarded.
+		// Even during revert, we do not decrease LastAssignedGeneration so that we
+		// can keep track of stale snapshots that need to be cleaned up.
+		pruneSnapshots(toUpdate.Status, nil)
 		toUpdate.Status.Crash = nil
 		return nil
 	})

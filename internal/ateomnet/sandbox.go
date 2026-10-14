@@ -23,6 +23,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 
 	"github.com/agent-substrate/substrate/internal/ateomnet/dns"
@@ -68,6 +69,10 @@ type SandboxNetworkConfig struct {
 	// EgressPort is where atunnel serves this actor. Every TCP connection the
 	// actor makes is redirected to it, whatever port it was aimed at.
 	EgressPort uint16
+
+	// DNSPolicy supplies the egress policy the actor's DNS queries are checked
+	// against. Nil refuses every query.
+	DNSPolicy dns.PolicySource
 }
 
 // SetupSandboxNetwork creates isolated networking with fixed sandbox addresses.
@@ -210,13 +215,18 @@ func setupGatewaySide(ctx context.Context, ns netns.Handle, egressPort uint16) e
 	}); err != nil {
 		return err
 	}
-	return installEgressRedirect(ns, egressPort)
+	return installEgressRules(ns, egressPort)
 }
 
-// installEgressRedirect redirects TCP egress to atunnel, excluding the sandbox's
-// own /30: that keeps ingress replies and DNS over TCP to the gateway off the
-// redirect, so the relay serves them on its own listener.
-func installEgressRedirect(ns netns.Handle, egressPort uint16) error {
+// installEgressRules rejects link-local traffic before it reaches the egress PEP,
+// then redirects other TCP egress to atunnel. The actor's own /30 is excluded
+// from both rules so ingress replies and DNS reach their local sockets.
+func installEgressRules(ns netns.Handle, egressPort uint16) error {
+	const (
+		icmpDestinationAdministrativelyProhibited   = 13
+		icmpv6DestinationAdministrativelyProhibited = 1
+	)
+
 	if egressPort == 0 {
 		return fmt.Errorf("actornet: atunnel egress port is required")
 	}
@@ -226,9 +236,54 @@ func installEgressRedirect(ns netns.Handle, egressPort uint16) error {
 	}
 	defer func() { _ = c.CloseLasting() }()
 
-	table := c.AddTable(&nftables.Table{Family: nftables.TableFamilyIPv4, Name: "ateom-actor"})
+	var ipv4Table *nftables.Table
+	for _, family := range []struct {
+		tableFamily nftables.TableFamily
+		name        string
+		addressLen  uint32
+		dstOffset   uint32
+		rejectCode  uint8
+		isPrefix    func(netip.Prefix) bool
+	}{
+		{nftables.TableFamilyIPv4, "ateom-actor", 4, 16, icmpDestinationAdministrativelyProhibited, func(prefix netip.Prefix) bool { return prefix.Addr().Is4() }},
+		{nftables.TableFamilyIPv6, "ateom-actor-v6", 16, 24, icmpv6DestinationAdministrativelyProhibited, func(prefix netip.Prefix) bool { return prefix.Addr().Is6() }},
+	} {
+		table := c.AddTable(&nftables.Table{Family: family.tableFamily, Name: family.name})
+		if family.tableFamily == nftables.TableFamilyIPv4 {
+			ipv4Table = table
+		}
+		filter := c.AddChain(&nftables.Chain{
+			Name: "disallowed-egress", Table: table, Type: nftables.ChainTypeFilter,
+			Hooknum: nftables.ChainHookPrerouting, Priority: nftables.ChainPriorityRaw,
+		})
+		if family.tableFamily == nftables.TableFamilyIPv4 {
+			c.AddRule(&nftables.Rule{Table: table, Chain: filter, Exprs: []expr.Any{
+				&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: family.dstOffset, Len: family.addressLen},
+				&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: actorSubnetMask, Xor: []byte{0, 0, 0, 0}},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: actorSubnetBase},
+				&expr.Verdict{Kind: expr.VerdictAccept},
+			}})
+		}
+		for _, prefix := range linkLocalEgressCIDRRanges {
+			if !family.isPrefix(prefix) {
+				continue
+			}
+			mask := net.CIDRMask(prefix.Bits(), int(family.addressLen*8))
+			address := prefix.Addr().AsSlice()
+			expressions := []expr.Any{
+				&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: family.dstOffset, Len: family.addressLen},
+			}
+			expressions = append(expressions,
+				&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: family.addressLen, Mask: mask, Xor: make([]byte, family.addressLen)},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: address},
+				&expr.Reject{Type: unix.NFT_REJECT_ICMP_UNREACH, Code: family.rejectCode},
+			)
+			c.AddRule(&nftables.Rule{Table: table, Chain: filter, Exprs: expressions})
+		}
+	}
+
 	prerouting := c.AddChain(&nftables.Chain{
-		Name: "prerouting", Table: table, Type: nftables.ChainTypeNAT,
+		Name: "prerouting", Table: ipv4Table, Type: nftables.ChainTypeNAT,
 		Hooknum: nftables.ChainHookPrerouting, Priority: nftables.ChainPriorityNATDest,
 	})
 
@@ -247,12 +302,20 @@ func installEgressRedirect(ns netns.Handle, egressPort uint16) error {
 		&expr.Immediate{Register: 1, Data: binaryutil.BigEndian.PutUint16(egressPort)},
 		&expr.Redir{RegisterProtoMin: 1},
 	)
-	c.AddRule(&nftables.Rule{Table: table, Chain: prerouting, Exprs: exprs})
+	c.AddRule(&nftables.Rule{Table: ipv4Table, Chain: prerouting, Exprs: exprs})
 
 	if err := c.Flush(); err != nil {
 		return fmt.Errorf("while installing the actor egress redirect: %w", err)
 	}
 	return nil
+}
+
+// linkLocalEgressCIDRRanges cover all IPv4 and IPv6 link-local space. The
+// nftables chain accepts the actor's 169.254.17.0/30 first because that network
+// carries actor ingress and DNS relay traffic.
+var linkLocalEgressCIDRRanges = []netip.Prefix{
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("fe80::/10"),
 }
 
 // The actor subnet, in the form the nftables comparison takes.
@@ -342,14 +405,16 @@ type SandboxSession struct {
 	Network *SandboxNetwork
 
 	mu      sync.Mutex
+	dns     *dns.Server
 	sockets []io.Closer
-	// serving counts the goroutines serving this sandbox, so Close can wait
-	// for them rather than just closing their sockets.
+	// serving counts the egress goroutines, so Close can wait for them rather
+	// than just closing their sockets. dns.Server waits for its own.
 	serving sync.WaitGroup
 }
 
 // ServeSandbox builds a sandbox's network and serves egress and DNS from its
 // gateway namespace. A nil server leaves that unserved, which fails closed.
+// DNS queries are checked against the policy cfg.DNSPolicy supplies.
 func ServeSandbox(ctx context.Context, cfg SandboxNetworkConfig, egress egressServer, resolver *dns.Relay) (_ *SandboxSession, retErr error) {
 	network, err := SetupSandboxNetwork(ctx, cfg)
 	if err != nil {
@@ -362,14 +427,12 @@ func ServeSandbox(ctx context.Context, cfg SandboxNetworkConfig, egress egressSe
 		}
 	}()
 
-	var serve []func()
 	if resolver != nil {
-		closers, serveDNS, err := resolver.Serve(ctx, network.GatewayNetNS)
+		dnsServer, err := resolver.Serve(ctx, network.GatewayNetNS, cfg.DNSPolicy)
 		if err != nil {
 			return nil, err
 		}
-		session.sockets = append(session.sockets, closers...)
-		serve = append(serve, serveDNS...)
+		session.dns = dnsServer
 	}
 	// Egress last: its binding is released by the serve goroutine, so nothing
 	// may fail between binding and starting it.
@@ -379,17 +442,15 @@ func ServeSandbox(ctx context.Context, cfg SandboxNetworkConfig, egress egressSe
 			return nil, err
 		}
 		session.sockets = append(session.sockets, closers...)
-		serve = append(serve, serveEgress...)
-	}
-
-	// Started here rather than inside the helpers so the session owns them and
-	// Close can report when they have stopped.
-	for _, fn := range serve {
-		session.serving.Add(1)
-		go func() {
-			defer session.serving.Done()
-			fn()
-		}()
+		// Started here rather than inside the helper so the session owns them
+		// and Close can report when they have stopped.
+		for _, fn := range serveEgress {
+			session.serving.Add(1)
+			go func() {
+				defer session.serving.Done()
+				fn()
+			}()
+		}
 	}
 	return session, nil
 }
@@ -400,8 +461,8 @@ func ServeSandbox(ctx context.Context, cfg SandboxNetworkConfig, egress egressSe
 // Idempotent, and every step's error is returned.
 func (s *SandboxSession) Close(ctx context.Context) error {
 	s.mu.Lock()
-	sockets, network := s.sockets, s.Network
-	s.sockets, s.Network = nil, nil
+	dnsServer, sockets, network := s.dns, s.sockets, s.Network
+	s.dns, s.sockets, s.Network = nil, nil, nil
 	s.mu.Unlock()
 
 	var errs error
@@ -409,6 +470,9 @@ func (s *SandboxSession) Close(ctx context.Context) error {
 		if err := c.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			errs = errors.Join(errs, err)
 		}
+	}
+	if dnsServer != nil {
+		errs = errors.Join(errs, dnsServer.Stop(ctx))
 	}
 
 	stopped := make(chan struct{})
