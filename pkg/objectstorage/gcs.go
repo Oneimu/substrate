@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -62,10 +63,12 @@ type gcsClient struct {
 	// A pooled client that authenticates differently from the one that opened
 	// an object fails partway through reading it.
 	opts []option.ClientOption
-	// pool holds extra clients so concurrent parts get their own connections;
-	// built on first use by uploadClient.
+	// pool holds extra clients so concurrent transfers get their own
+	// connections; built on first use by uploadClient. next is the round-robin
+	// position for single-request transfers, see nextClient.
 	poolOnce sync.Once
 	pool     []*storage.Client
+	next     atomic.Uint64
 }
 
 // NewGCSClient returns a GCS-backed ObjectStorage. It builds its own
@@ -131,9 +134,10 @@ func (g *gcsClient) PutObject(ctx context.Context, bucket, object string, reader
 	return g.putComposite(ctx, bucket, object, bytes.NewReader(head[:n]), reader)
 }
 
-// putSingle writes the whole body in one resumable request.
+// putSingle writes the whole body in one resumable request, on a pooled client so
+// the small objects a node uploads concurrently do not queue on one connection.
 func (g *gcsClient) putSingle(ctx context.Context, bucket, object string, reader io.Reader) error {
-	wc := g.client.Bucket(bucket).Object(object).NewWriter(ctx)
+	wc := g.nextClient(ctx).Bucket(bucket).Object(object).NewWriter(ctx)
 	wc.ChunkSize = uploadChunkSize
 	// io.Copy reports local read errors; wc.Close() reports the actual
 	// GCS upload (auth, permissions, transient). Join both so the caller

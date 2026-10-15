@@ -28,8 +28,11 @@ import (
 func (g *gcsClient) GetObject(ctx context.Context, bucket, object string) (io.ReadCloser, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	// The first chunk doubles as the size probe: a range read reports the whole
-	// object's size in its attrs, so nothing pays an extra round trip for it.
-	head, err := g.client.Bucket(bucket).Object(object).NewRangeReader(ctx, 0, downloadChunkSize)
+	// object's size in its attrs, so nothing pays an extra round trip for it. It
+	// goes out on a pooled client because for most snapshots it is the whole
+	// download, and a node restoring several at once must not queue them all on
+	// one connection.
+	head, err := g.nextClient(ctx).Bucket(bucket).Object(object).NewRangeReader(ctx, 0, downloadChunkSize)
 	if err != nil {
 		cancel()
 		if errors.Is(err, storage.ErrObjectNotExist) || errors.Is(err, storage.ErrBucketNotExist) {

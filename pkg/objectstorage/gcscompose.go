@@ -31,7 +31,9 @@ import (
 // parts over. One client keeps a single HTTP/2 connection per host and multiplexes
 // every part onto it, so parts that should be independent share one TCP stream:
 // measured on a GKE worker node at 8 streams, 334 MB/s shared against 518 MB/s with a
-// connection each.
+// connection each. The same holds for the many small objects a node moves at once:
+// each snapshot below the part and range thresholds is a single request, so the
+// single-request paths draw on this pool too (see nextClient).
 const uploadPoolSize = 8
 
 // uploadClient returns the client part i should use, or the default client if the pool
@@ -53,6 +55,12 @@ func (g *gcsClient) uploadClient(ctx context.Context, i int) *storage.Client {
 		return g.client
 	}
 	return g.pool[i%len(g.pool)]
+}
+
+// nextClient hands out pooled clients round-robin, for a transfer that is one
+// request and so has no part or range index of its own.
+func (g *gcsClient) nextClient(ctx context.Context) *storage.Client {
+	return g.uploadClient(ctx, int(g.next.Add(1)-1))
 }
 
 // One stream to GCS tops out near 100 MiB/s however it is chunked; several do not
