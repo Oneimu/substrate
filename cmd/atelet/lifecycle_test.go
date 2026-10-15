@@ -296,8 +296,8 @@ func TestLocalSnapshotGC(t *testing.T) {
 
 // TestPauseAgainPrunesThePreviousSnapshotAfterTheResponse checks that a pause
 // following a resume leaves the new local snapshot in place and removes the
-// previous one, and that the removal is not something the Checkpoint response
-// waited for.
+// previous one, and that the Checkpoint response does not wait for that
+// removal: it returns while the removal is still held open.
 func TestPauseAgainPrunesThePreviousSnapshotAfterTheResponse(t *testing.T) {
 	useTempNodeDirs(t)
 	ctx := t.Context()
@@ -399,12 +399,20 @@ func TestPauseAgainPrunesThePreviousSnapshotAfterTheResponse(t *testing.T) {
 	}
 
 	resume("pause-snap-1")
+
+	// Hold the first snapshot's removal open, as a disk that is behind would:
+	// the second pause must still return, with its own snapshot complete and
+	// the first one still on disk, because the removal runs after the reply.
+	started, release := blockRemovals(t)
 	pause("pause-snap-2")
-	// The second pause's response does not wait for the first snapshot's
-	// removal; whatever state that removal is in, the new snapshot is complete.
 	if _, err := os.Stat(filepath.Join(snapshotDir("pause-snap-2"), "checkpoint.img")); err != nil {
 		t.Fatalf("second pause did not leave its snapshot: %v", err)
 	}
+	<-started
+	if _, err := os.Stat(snapshotDir("pause-snap-1")); err != nil {
+		t.Fatalf("first snapshot was removed before the removal was released: %v", err)
+	}
+	close(release)
 	s.localCheckpointPrunes.Wait()
 	if _, err := os.Stat(snapshotDir("pause-snap-1")); !os.IsNotExist(err) {
 		t.Errorf("first snapshot survived the second pause (stat err = %v)", err)

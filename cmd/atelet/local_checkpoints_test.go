@@ -23,6 +23,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/ateletpath"
 	"github.com/agent-substrate/substrate/internal/resources"
 )
@@ -143,6 +146,35 @@ func TestPruneKeepOfMissingDirPlansNothing(t *testing.T) {
 	}
 }
 
+// blockRemovals swaps removeLocalCheckpoint for one that blocks until release
+// is closed, as a disk that is far behind would; started receives once per
+// blocked call.
+func blockRemovals(t *testing.T) (started <-chan struct{}, release chan struct{}) {
+	t.Helper()
+	rel := make(chan struct{})
+	st := make(chan struct{}, 8)
+	orig := removeLocalCheckpoint
+	removeLocalCheckpoint = func(path string) error {
+		select {
+		case st <- struct{}{}:
+		default:
+		}
+		<-rel
+		return orig(path)
+	}
+	t.Cleanup(func() { removeLocalCheckpoint = orig })
+	return st, rel
+}
+
+// mkSnapshotDir is writeSnapshotDir without t.Fatal, for use off the test
+// goroutine.
+func mkSnapshotDir(dir, name string) error {
+	if err := os.MkdirAll(filepath.Join(dir, name), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, name, "memory.img"), []byte("x"), 0o600)
+}
+
 func TestPruneAfterResponseWaitsForThePreviousRemoval(t *testing.T) {
 	useTempNodeDirs(t)
 	const actorUID = "actor-uid-backpressure"
@@ -150,20 +182,7 @@ func TestPruneAfterResponseWaitsForThePreviousRemoval(t *testing.T) {
 	for _, name := range []string{"pause-1", "pause-2"} {
 		writeSnapshotDir(t, dir, name)
 	}
-
-	// The first removal blocks until released, as a disk that is behind would.
-	release := make(chan struct{})
-	started := make(chan struct{}, 1)
-	orig := removeLocalCheckpoint
-	removeLocalCheckpoint = func(path string) error {
-		select {
-		case started <- struct{}{}:
-		default:
-		}
-		<-release
-		return orig(path)
-	}
-	t.Cleanup(func() { removeLocalCheckpoint = orig })
+	started, release := blockRemovals(t)
 
 	s := &AteomHerder{}
 	ref := resources.ActorRef{Atespace: "ate-demo", Name: "counter"}
@@ -172,21 +191,30 @@ func TestPruneAfterResponseWaitsForThePreviousRemoval(t *testing.T) {
 
 	// The next pause must wait for that removal before it writes anything:
 	// at most one superseded snapshot per actor is ever pending.
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		s.waitForLocalCheckpointRemoval(context.Background(), ref, actorUID)
-		writeSnapshotDir(t, dir, "pause-3")
+		if err := s.waitForLocalCheckpointRemoval(context.Background(), ref, actorUID); err != nil {
+			done <- err
+			return
+		}
+		if err := mkSnapshotDir(dir, "pause-3"); err != nil {
+			done <- err
+			return
+		}
 		s.pruneLocalCheckpointsAfterResponse(context.Background(), ref, actorUID, "pause-3")
-		close(done)
+		done <- nil
 	}()
 	select {
-	case <-done:
-		t.Fatal("second pause returned while the previous removal was still running")
+	case err := <-done:
+		t.Fatalf("second pause returned (%v) while the previous removal was still running", err)
 	case <-time.After(200 * time.Millisecond):
 	}
 	close(release)
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("second pause: %v", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("second pause did not return after the previous removal finished")
 	}
@@ -196,5 +224,41 @@ func TestPruneAfterResponseWaitsForThePreviousRemoval(t *testing.T) {
 		if got := err == nil; got != want {
 			t.Errorf("%s exists = %v, want %v (err %v)", name, got, want, err)
 		}
+	}
+	s.pendingRemovalsMu.Lock()
+	left := len(s.pendingRemovals)
+	s.pendingRemovalsMu.Unlock()
+	if left != 0 {
+		t.Errorf("%d pending-removal entries left after every removal finished, want 0", left)
+	}
+}
+
+func TestWaitForLocalCheckpointRemovalHonorsContext(t *testing.T) {
+	useTempNodeDirs(t)
+	const actorUID = "actor-uid-ctx"
+	dir := ateletpath.LocalCheckpointsDir(actorUID)
+	writeSnapshotDir(t, dir, "pause-1")
+	writeSnapshotDir(t, dir, "pause-2")
+	started, release := blockRemovals(t)
+
+	s := &AteomHerder{}
+	ref := resources.ActorRef{Atespace: "ate-demo", Name: "counter"}
+	s.pruneLocalCheckpointsAfterResponse(context.Background(), ref, actorUID, "pause-2")
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := s.waitForLocalCheckpointRemoval(ctx, ref, actorUID)
+	// Let the removal finish before the test's temp dirs go away.
+	close(release)
+	s.localCheckpointPrunes.Wait()
+	// The deadline comes back with its own gRPC code, so the control plane
+	// retries instead of treating it as an internal failure.
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("waitForLocalCheckpointRemoval() = %v, want gRPC code DeadlineExceeded", err)
+	}
+	// Once the removal has finished, the same wait returns at once.
+	if err := s.waitForLocalCheckpointRemoval(context.Background(), ref, actorUID); err != nil {
+		t.Fatalf("waitForLocalCheckpointRemoval() after the removal finished = %v, want nil", err)
 	}
 }
