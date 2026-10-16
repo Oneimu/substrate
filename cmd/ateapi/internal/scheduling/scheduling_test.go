@@ -19,6 +19,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"k8s.io/apimachinery/pkg/labels"
@@ -516,9 +517,17 @@ func TestApplies(t *testing.T) {
 	}
 }
 
+// fleet is a WorkerSource over bare records, deriving each Entry on every
+// call the way the cache derives it on ingestion.
 type fleet []*ateapipb.Worker
 
-func (f fleet) Workers() ([]*ateapipb.Worker, error) { return f, nil }
+func (f fleet) Entries() ([]*workercache.Entry, error) {
+	out := make([]*workercache.Entry, 0, len(f))
+	for _, w := range f {
+		out = append(out, workercache.NewEntry(w))
+	}
+	return out, nil
+}
 
 func worker(pod, class, node string, lbls map[string]string, opts ...func(*ateapipb.Worker)) *ateapipb.Worker {
 	w := &ateapipb.Worker{

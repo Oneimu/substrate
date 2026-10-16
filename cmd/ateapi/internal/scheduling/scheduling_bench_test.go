@@ -19,15 +19,15 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
 // benchFleet is a fleet of n active workers that each report CPU and memory
-// capacity and hold between one and fifteen residents, so allocation strings
-// vary across the fleet the way they do under load and the check sees memo
-// misses as well as hits, while Schedule exercises the comparison on every
-// worker.
+// capacity and hold between one and fifteen residents, so allocations vary
+// across the fleet the way they do under load, while Schedule exercises the
+// comparison on every worker.
 func benchFleet(n int) fleet {
 	f := make(fleet, 0, n)
 	for i := range n {
@@ -40,10 +40,21 @@ func benchFleet(n int) fleet {
 	return f
 }
 
+// ingested is a WorkerSource over entries derived once, as the cache serves
+// them, so Schedule is measured without the per-call derivation fleet does.
+type ingested []*workercache.Entry
+
+func (in ingested) Entries() ([]*workercache.Entry, error) { return in, nil }
+
+func ingest(f fleet) ingested {
+	entries, _ := f.Entries()
+	return entries
+}
+
 func BenchmarkSchedule(b *testing.B) {
 	for _, n := range []int{100, 1000} {
 		b.Run(fmt.Sprintf("workers=%d", n), func(b *testing.B) {
-			s := New(benchFleet(n), WithIntn(firstIntn))
+			s := New(ingest(benchFleet(n)), WithIntn(firstIntn))
 			constraints := Constraints{SandboxClass: "gvisor", Limits: resources.CPUMemory(500, 1<<30)}
 			b.ReportAllocs()
 			for b.Loop() {
@@ -55,9 +66,11 @@ func BenchmarkSchedule(b *testing.B) {
 	}
 }
 
+// HasRoom reads a bare record, so unlike Schedule it parses the worker's
+// quantities; it runs once per bind rather than once per worker per pass.
 func BenchmarkHasRoom(b *testing.B) {
 	w := benchFleet(1)[0]
-	s := New(fleet{w})
+	s := New(ingest(fleet{w}))
 	constraints := Constraints{SandboxClass: "gvisor", Limits: resources.CPUMemory(500, 1<<30)}
 	b.ReportAllocs()
 	for b.Loop() {

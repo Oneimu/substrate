@@ -17,9 +17,9 @@ package scheduling
 import (
 	"testing"
 
+	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func limits(pairs ...string) *ateapipb.Resources {
@@ -30,10 +30,28 @@ func limits(pairs ...string) *ateapipb.Resources {
 	return out
 }
 
-// RoomCheck reads the wire form directly, so it is held to the same answers as
-// parsing everything into Quantities, subtracting, and comparing dimension by
-// dimension.
-func TestRoomCheckAgreesWithQuantities(t *testing.T) {
+// recorded is a worker with one free actor slot whose capacity and allocation
+// read as given, so a test is about the quantities alone.
+func recorded(capacity, allocated *ateapipb.Resources) *ateapipb.Worker {
+	return &ateapipb.Worker{Status: &ateapipb.WorkerStatus{
+		Capacity:  &ateapipb.WorkerResources{Actors: 1, Resources: capacity},
+		Allocated: &ateapipb.WorkerResources{Resources: allocated},
+	}}
+}
+
+func mustNeed(t *testing.T, want *ateapipb.Resources) workercache.Amounts {
+	t.Helper()
+	need, err := workercache.ParseAmounts(want)
+	if err != nil {
+		t.Fatalf("ParseAmounts: %v", err)
+	}
+	return need
+}
+
+// The room check compares what the cache derived against what the actor
+// parsed, so it is held to the same answers as parsing everything into
+// Quantities, subtracting, and comparing dimension by dimension.
+func TestHasRoomAgreesWithQuantities(t *testing.T) {
 	tests := []struct {
 		name      string
 		want      *ateapipb.Resources
@@ -78,6 +96,13 @@ func TestRoomCheckAgreesWithQuantities(t *testing.T) {
 			want:      limits("cpu", "1"),
 			capacity:  limits("cpu", "2"),
 			allocated: limits("cpu", "3"),
+			ok:        false,
+		},
+		{
+			name:      "a dimension only the allocation names is overcommitted",
+			want:      limits("nvidia.com/gpu", "1"),
+			capacity:  limits("cpu", "2"),
+			allocated: limits("nvidia.com/gpu", "1"),
 			ok:        false,
 		},
 		{
@@ -128,7 +153,7 @@ func TestRoomCheckAgreesWithQuantities(t *testing.T) {
 		},
 		{
 			// Nine decimal places under a ten-digit byte count overflow an int64
-			// at nano scale, so these stay inf.Dec: the slow arithmetic path.
+			// at nano scale, so these stay inf.Dec: the slow comparison path.
 			name:      "quantities that stay inf.Dec fit",
 			want:      limits("memory", "1.5Gi"),
 			capacity:  limits("memory", "12.000000001Gi"),
@@ -141,29 +166,32 @@ func TestRoomCheckAgreesWithQuantities(t *testing.T) {
 			capacity:  limits("memory", "12.000000001Gi"),
 			allocated: limits("memory", "10.600000001Gi"),
 		},
+		{
+			name:      "an inf.Dec size against an int64 remainder",
+			want:      limits("memory", "1.000000001Gi"),
+			capacity:  limits("memory", "4Gi"),
+			allocated: limits("memory", "2Gi"),
+			ok:        true,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			check, err := NewRoomCheck(tc.want)
-			if err != nil {
-				t.Fatalf("NewRoomCheck: %v", err)
-			}
-			got := check.Admits(tc.capacity, tc.allocated)
+			got := hasRoom(workercache.NewEntry(recorded(tc.capacity, tc.allocated)), mustNeed(t, tc.want))
 			if got != tc.ok {
-				t.Errorf("Admits() = %v, want %v", got, tc.ok)
+				t.Errorf("hasRoom() = %v, want %v", got, tc.ok)
 			}
 			if ref := referenceAnswer(t, tc.want, tc.capacity, tc.allocated); got != ref {
-				t.Errorf("Admits() = %v but the long way through Quantities says %v", got, ref)
+				t.Errorf("hasRoom() = %v but the long way through Quantities says %v", got, ref)
 			}
 		})
 	}
 }
 
 // referenceAnswer is the question asked the long way, through Quantities. It
-// is the specification Admits is checked against: capacity less allocated must
-// reach the Actor's size in every dimension the Actor names. A dimension the
-// Worker never reported reads as zero, since a Worker reports everything it
-// has, and a dimension gone negative from overcommit covers nothing.
+// is the specification hasRoom is checked against: capacity less allocated
+// must reach the actor's size in every dimension the actor names. A dimension
+// the worker never reported reads as zero, since a worker reports everything
+// it has, and a dimension gone negative from overcommit covers nothing.
 func referenceAnswer(t *testing.T, want, capacity, allocated *ateapipb.Resources) bool {
 	t.Helper()
 	need, err := resources.ParseQuantities(want)
@@ -191,47 +219,45 @@ func referenceAnswer(t *testing.T, want, capacity, allocated *ateapipb.Resources
 	return true
 }
 
-func TestRoomCheckUnreadableRecords(t *testing.T) {
+func TestHasRoomUnreadableRecords(t *testing.T) {
 	t.Run("an unparseable size is an error", func(t *testing.T) {
-		if _, err := NewRoomCheck(limits("cpu", "banana")); err == nil {
-			t.Error("NewRoomCheck() = nil error, want one")
+		if _, err := workercache.ParseAmounts(limits("cpu", "banana")); err == nil {
+			t.Error("ParseAmounts() = nil error, want one")
 		}
 	})
 
-	check, err := NewRoomCheck(limits("cpu", "1"))
-	if err != nil {
-		t.Fatalf("NewRoomCheck: %v", err)
-	}
+	need := mustNeed(t, limits("cpu", "1"))
 	t.Run("an unparseable capacity has no room, even in a dimension not asked for", func(t *testing.T) {
-		if check.Admits(limits("cpu", "4", "memory", "lots"), nil) {
-			t.Error("Admits() = true, want false")
+		if hasRoom(workercache.NewEntry(recorded(limits("cpu", "4", "memory", "lots"), nil)), need) {
+			t.Error("hasRoom() = true, want false")
 		}
 	})
 	t.Run("an unparseable allocation has no room", func(t *testing.T) {
-		if check.Admits(limits("cpu", "4"), limits("cpu", "some")) {
-			t.Error("Admits() = true, want false")
-		}
-	})
-	t.Run("a memoized failure still has no room", func(t *testing.T) {
-		if check.Admits(limits("cpu", "some"), nil) {
-			t.Error("Admits() = true, want false")
+		if hasRoom(workercache.NewEntry(recorded(limits("cpu", "4"), limits("cpu", "some"))), need) {
+			t.Error("hasRoom() = true, want false")
 		}
 	})
 	t.Run("an actor asking for nothing is not blocked by an unreadable worker", func(t *testing.T) {
-		check, err := NewRoomCheck(nil)
-		if err != nil {
-			t.Fatalf("NewRoomCheck: %v", err)
+		if !hasRoom(workercache.NewEntry(recorded(limits("cpu", "banana"), nil)), nil) {
+			t.Error("hasRoom() = false, want true")
 		}
-		if !check.Admits(limits("cpu", "banana"), nil) {
-			t.Error("Admits() = false, want true")
+	})
+	t.Run("HasRoom on a bare record answers the same", func(t *testing.T) {
+		s := New(nil)
+		constraints := Constraints{Limits: limits("cpu", "1")}
+		if s.HasRoom(recorded(limits("cpu", "some"), nil), constraints) {
+			t.Error("HasRoom() = true for an unreadable capacity, want false")
+		}
+		if !s.HasRoom(recorded(limits("cpu", "4"), nil), constraints) {
+			t.Error("HasRoom() = false for a readable worker with room, want true")
 		}
 	})
 }
 
-// The check is asked of every worker in the fleet on every placement, so it
-// must not allocate per worker once it has seen the fleet's quantity strings,
-// whether or not they take ParseQuantity's int64 fast path.
-func TestRoomCheckAllocatesNothingPerWorker(t *testing.T) {
+// The check is asked of every worker in the fleet on every placement, so with
+// the fleet already ingested it must not allocate per worker, whether or not
+// the quantities take ParseQuantity's int64 fast path.
+func TestHasRoomAllocatesNothingPerWorker(t *testing.T) {
 	for _, tc := range []struct {
 		name                      string
 		want, capacity, allocated *ateapipb.Resources
@@ -250,61 +276,50 @@ func TestRoomCheckAllocatesNothingPerWorker(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			check, err := NewRoomCheck(tc.want)
-			if err != nil {
-				t.Fatalf("NewRoomCheck: %v", err)
-			}
-			if !check.Admits(tc.capacity, tc.allocated) {
-				t.Fatal("Admits() = false, want true")
+			entry := workercache.NewEntry(recorded(tc.capacity, tc.allocated))
+			need := mustNeed(t, tc.want)
+			if !hasRoom(entry, need) {
+				t.Fatal("hasRoom() = false, want true")
 			}
 			allocs := testing.AllocsPerRun(100, func() {
-				if !check.Admits(tc.capacity, tc.allocated) {
-					t.Fatal("Admits() = false, want true")
+				if !hasRoom(entry, need) {
+					t.Fatal("hasRoom() = false, want true")
 				}
 			})
 			if allocs != 0 {
-				t.Errorf("Admits() allocates %v times per worker, want 0", allocs)
+				t.Errorf("hasRoom() allocates %v times per worker, want 0", allocs)
 			}
 		})
 	}
 }
 
-// A memoized quantity is read for every worker checked. Arithmetic on the
-// worker's scratch must never write back into the memo, or one worker's
-// subtraction would change what the next worker is compared against.
-func TestRoomCheckMemoIsNotMutated(t *testing.T) {
+// An Entry is shared by every pass and every goroutine scheduling at once, so
+// comparing against it must never write into it, whichever form either side
+// takes. Quantity.Cmp rewrites its receiver into inf.Dec when the other side
+// is one; this checks that rewrite lands on a copy.
+func TestHasRoomLeavesTheEntryUntouched(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
+		want      string
 		capacity  string
 		allocated string
 	}{
-		{name: "int64 form", capacity: "3.5Gi", allocated: "1.5Gi"},
-		{
-			// Nine decimal places under a ten-digit byte count overflow an
-			// int64 at nano scale, so both stay inf.Dec in the memo, and the
-			// scratch arithmetic reads them through a shared pointer.
-			name:      "inf.Dec form",
-			capacity:  "12.000000001Gi",
-			allocated: "9.000000001Gi",
-		},
+		{name: "int64 remainder against an int64 size", want: "1.5Gi", capacity: "3.5Gi", allocated: "1.5Gi"},
+		{name: "int64 remainder against an inf.Dec size", want: "1.000000001Gi", capacity: "4Gi", allocated: "1Gi"},
+		{name: "inf.Dec remainder against an int64 size", want: "1.5Gi", capacity: "12.000000001Gi", allocated: "9.000000001Gi"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			check, err := NewRoomCheck(limits("memory", "1.5Gi"))
-			if err != nil {
-				t.Fatalf("NewRoomCheck: %v", err)
-			}
-			capacity := limits("memory", tc.capacity)
-			allocated := limits("memory", tc.allocated)
+			entry := workercache.NewEntry(recorded(limits("memory", tc.capacity), limits("memory", tc.allocated)))
+			before := entry.Room.Free.Get("memory").DeepCopy()
+			need := mustNeed(t, limits("memory", tc.want))
 			for i := range 3 {
-				if !check.Admits(capacity, allocated) {
-					t.Fatalf("round %d: Admits() = false, want true", i)
+				if !hasRoom(entry, need) {
+					t.Fatalf("round %d: hasRoom() = false, want true", i)
 				}
 			}
-			for s, p := range check.parsed {
-				want := resource.MustParse(s)
-				if p.quantity.Cmp(want) != 0 {
-					t.Errorf("memo for %q drifted to %v", s, p.quantity.String())
-				}
+			after := entry.Room.Free.Get("memory")
+			if after.Cmp(before) != 0 || after.String() != before.String() {
+				t.Errorf("free memory drifted from %v to %v", before.String(), after.String())
 			}
 		})
 	}
