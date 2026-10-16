@@ -25,6 +25,7 @@ import (
 
 	"cloud.google.com/go/storage"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/api/option"
 )
 
 // uploadPoolSize is how many storage.Clients the parallel part upload spreads its
@@ -36,21 +37,31 @@ import (
 // single-request paths draw on this pool too (see nextClient).
 const uploadPoolSize = 8
 
-// uploadClient returns the client part i should use, or the default client if the pool
-// could not be built (a pool failure costs throughput, not correctness).
-func (g *gcsClient) uploadClient(ctx context.Context, i int) *storage.Client {
-	g.poolOnce.Do(func() {
-		for range uploadPoolSize {
-			// The clients outlive this call, so they must not hold its cancellation.
-			c, err := storage.NewClient(context.WithoutCancel(ctx), g.opts...)
-			if err != nil {
-				slog.WarnContext(ctx, "Falling back to one client for part uploads", slog.Any("err", err))
-				return
-			}
-			setRetry(c)
-			g.pool = append(g.pool, c)
+// newPool builds the uploadPoolSize clients transfers are spread over, from the
+// same opts as the client they stand in for: a pooled client that authenticates
+// differently from the one that opened an object fails partway through reading
+// it. It is built with that client rather than on first use, so a burst of
+// transfers on a fresh node does not wait for it. A pool that could not be
+// completed is used as far as it got, down to none: that costs throughput, not
+// correctness.
+func newPool(ctx context.Context, opts []option.ClientOption) []*storage.Client {
+	pool := make([]*storage.Client, 0, uploadPoolSize)
+	for range uploadPoolSize {
+		c, err := storage.NewClient(ctx, opts...)
+		if err != nil {
+			slog.WarnContext(ctx, "GCS connection pool is short; transfers share fewer connections",
+				slog.Int("built", len(pool)), slog.Int("want", uploadPoolSize), slog.Any("err", err))
+			break
 		}
-	})
+		setRetry(c)
+		pool = append(pool, c)
+	}
+	return pool
+}
+
+// uploadClient returns the client part i should use, or the default client if there
+// is no pool.
+func (g *gcsClient) uploadClient(i int) *storage.Client {
 	if len(g.pool) == 0 {
 		return g.client
 	}
@@ -59,8 +70,8 @@ func (g *gcsClient) uploadClient(ctx context.Context, i int) *storage.Client {
 
 // nextClient hands out pooled clients round-robin, for a transfer that is one
 // request and so has no part or range index of its own.
-func (g *gcsClient) nextClient(ctx context.Context) *storage.Client {
-	return g.uploadClient(ctx, int(g.next.Add(1)-1))
+func (g *gcsClient) nextClient() *storage.Client {
+	return g.uploadClient(int(g.next.Add(1) - 1))
 }
 
 // One stream to GCS tops out near 100 MiB/s however it is chunked; several do not
@@ -123,7 +134,7 @@ func (g *gcsClient) putComposite(ctx context.Context, bucket, object string, hea
 		if n > 0 {
 			part := bkt.Object(fmt.Sprintf("%s.part-%s-%04d", object, runID, i))
 			parts = append(parts, part)
-			upPart := g.uploadClient(ctx, i).Bucket(bucket).Object(part.ObjectName())
+			upPart := g.uploadClient(i).Bucket(bucket).Object(part.ObjectName())
 			data := buf[:n]
 			g2.Go(func() error {
 				defer func() { free <- buf }()

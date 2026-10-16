@@ -51,7 +51,7 @@ func TestPooledClientsAreBuiltLikeTheClientTheyStandIn(t *testing.T) {
 	}
 	defer g.client.Close()
 
-	pooled := g.uploadClient(ctx, 0)
+	pooled := g.uploadClient(0)
 	if pooled == nil {
 		t.Fatal("uploadClient returned nil")
 	}
@@ -63,7 +63,7 @@ func TestPooledClientsAreBuiltLikeTheClientTheyStandIn(t *testing.T) {
 		t.Errorf("pool holds %d clients, want %d", len(g.pool), uploadPoolSize)
 	}
 	for i := range uploadPoolSize {
-		if c := g.uploadClient(ctx, i); c == nil || c == g.client {
+		if c := g.uploadClient(i); c == nil || c == g.client {
 			t.Errorf("uploadClient(%d) did not return a pooled connection", i)
 		}
 	}
@@ -110,7 +110,6 @@ func TestSingleRequestTransfersSpreadOverThePool(t *testing.T) {
 	for i := range hits {
 		g.pool = append(g.pool, recordingClient(t, &hits[i]))
 	}
-	g.poolOnce.Do(func() {}) // The pool is set up; do not build one.
 
 	ctx := t.Context()
 	for i := range 2 * len(hits) {

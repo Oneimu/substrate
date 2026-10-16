@@ -106,9 +106,7 @@ func TestGCSGetObjectReportsSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	g := &gcsClient{client: client}
-	g.poolOnce.Do(func() {}) // Use the same test client for every transfer.
-	rc, err := g.GetObject(t.Context(), "bucket", "object")
+	rc, err := (&gcsClient{client: client}).GetObject(t.Context(), "bucket", "object")
 	if err != nil {
 		t.Fatal(err)
 	}
