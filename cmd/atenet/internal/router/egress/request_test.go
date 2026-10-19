@@ -26,12 +26,12 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/extproc"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 )
 
 // testActorSPIFFEID is the identity filter state the CONNECT chain shares.
-const testActorSPIFFEID = "spiffe://substrate-actor.local/ateom-for-actor/default/my-actor"
+const testActorSPIFFEID = "spiffe://substrate-actor.local/worker-for-actor/default/my-actor"
 
 // testDialed is the IP:port the test actor's kernel dialed for a callout on
 // leg: the default port of the protocol that leg carries.
@@ -344,6 +344,27 @@ func TestRequestLegDeniesHTTP1WebSocketUpgrade(t *testing.T) {
 	}
 }
 
+func TestRequestLegDeniesConnect(t *testing.T) {
+	for name, policy := range map[string]*ateapipb.EgressPolicy{
+		"allow-all policy": allowAllPolicy(),
+		"no policy":        nil,
+	} {
+		for _, leg := range []string{extproc.EgressCleartextFilterChainName, extproc.EgressTLSMITMFilterChainName} {
+			for _, method := range []string{"CONNECT", "connect"} {
+				t.Run(name+"/"+leg+"/"+method, func(t *testing.T) {
+					h := policyHandler(policy)
+					md := innerMetadata(leg, method, "api.example.com:443", nil)
+					_, err := h.HandleRequestHeaders(context.Background(), md)
+					wantStatus(t, err, envoy_type.StatusCode_Forbidden)
+					if err.Error() != connectDeniedBody {
+						t.Errorf("denial body = %q, want %q", err, connectDeniedBody)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestRequestLegAllowsOrdinaryHTTPSRequest(t *testing.T) {
 	h := policyHandler(allowAllPolicy())
 	for _, tc := range []struct {
@@ -410,7 +431,7 @@ func TestRequestLegPolicyLookup(t *testing.T) {
 // could be allowed through it, and warms the cache for the requests inside.
 func TestConnectLegRequiresAPolicy(t *testing.T) {
 	ca := newTestCA(t, "actor-identity-ca")
-	leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/ateom-for-actor/default/my-actor", actorCertOptions{})
+	leaf := ca.issueActorCert(t, "spiffe://substrate-actor.local/worker-for-actor/default/my-actor", actorCertOptions{})
 
 	tests := []struct {
 		name   string

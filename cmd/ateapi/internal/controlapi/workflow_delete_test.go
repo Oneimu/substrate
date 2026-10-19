@@ -20,13 +20,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
-	"github.com/agent-substrate/substrate/internal/apierror"
-	"github.com/agent-substrate/substrate/internal/objectstore/objectstoretest"
-	"github.com/agent-substrate/substrate/internal/objectstoreplugin/objectstoreplugintest"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store/storetest"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/objectstore/objectstoretest"
+	"go.ate.dev/substrate/internal/objectstoreplugin/objectstoreplugintest"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 )
 
@@ -34,67 +34,33 @@ func TestDeleteActorWorkflow_ExecutionPaths(t *testing.T) {
 	tests := []struct {
 		name        string
 		seedState   ateapipb.ActorState
-		anyState    bool
 		missingTmpl bool
-		wantErr     bool
-		wantCode    codes.Code
 	}{
 		{
 			name:      "delete suspended actor succeeds",
 			seedState: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
-			anyState:  false,
-			wantErr:   false,
 		},
 		{
 			name:      "delete crashed actor succeeds",
 			seedState: ateapipb.ActorState_ACTOR_STATE_CRASHED,
-			anyState:  false,
-			wantErr:   false,
 		},
 		{
 			name:      "delete deleting actor succeeds",
 			seedState: ateapipb.ActorState_ACTOR_STATE_DELETING,
-			anyState:  false,
-			wantErr:   false,
 		},
 		{
-			name:      "delete running actor rejected when not any_state",
+			name:      "delete running actor succeeds",
 			seedState: ateapipb.ActorState_ACTOR_STATE_RUNNING,
-			anyState:  false,
-			wantErr:   true,
-			wantCode:  codes.FailedPrecondition,
-		},
-		{
-			name:      "any_state delete suspended actor succeeds",
-			seedState: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
-			anyState:  true,
-			wantErr:   false,
-		},
-		{
-			name:      "any_state delete running actor succeeds",
-			seedState: ateapipb.ActorState_ACTOR_STATE_RUNNING,
-			anyState:  true,
-			wantErr:   false,
-		},
-		{
-			name:      "any_state delete crashed actor succeeds",
-			seedState: ateapipb.ActorState_ACTOR_STATE_CRASHED,
-			anyState:  true,
-			wantErr:   false,
 		},
 		{
 			name:        "delete suspended actor with missing template succeeds",
 			seedState:   ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
-			anyState:    false,
 			missingTmpl: true,
-			wantErr:     false,
 		},
 		{
-			name:        "any_state delete suspended actor with missing template succeeds",
-			seedState:   ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
-			anyState:    true,
+			name:        "delete running actor with missing template succeeds",
+			seedState:   ateapipb.ActorState_ACTOR_STATE_RUNNING,
 			missingTmpl: true,
-			wantErr:     false,
 		},
 	}
 
@@ -112,79 +78,43 @@ func TestDeleteActorWorkflow_ExecutionPaths(t *testing.T) {
 			}
 			seedWorkflowActor(t, ctx, st, actorRef, "ns", tmplName, tc.seedState)
 
-			deleted, err := w.DeleteActor(ctx, actorRef, tc.anyState, store.DeletePreconditions{})
-			if tc.wantErr {
-				if got := apierror.Code(err); got != tc.wantCode {
-					t.Fatalf("apierror.Code(err) = %v, want %v (err: %v)", got, tc.wantCode, err)
-				}
-			} else {
-				if err != nil {
-					t.Fatalf("DeleteActor failed: %v", err)
-				}
-				if deleted == nil {
-					t.Fatalf("expected non-nil deleted actor")
-				}
-				if _, err := st.GetActor(ctx, actorRef); err == nil {
-					t.Errorf("expected actor to be deleted from store, but it still exists")
-				}
+			deleted, err := w.DeleteActor(ctx, actorRef, store.DeletePreconditions{})
+			if err != nil {
+				t.Fatalf("DeleteActor failed: %v", err)
+			}
+			if deleted == nil {
+				t.Fatalf("expected non-nil deleted actor")
+			}
+			if _, err := st.GetActor(ctx, actorRef); err == nil {
+				t.Errorf("expected actor to be deleted from store, but it still exists")
 			}
 		})
 	}
 }
 
-func TestEnsureMarkedDeleting_StateMatrix(t *testing.T) {
-	tests := []struct {
-		name     string
-		anyState bool
-		allowed  map[ateapipb.ActorState]bool
-	}{
-		{
-			name:     "standard delete",
-			anyState: false,
-			allowed: map[ateapipb.ActorState]bool{
-				ateapipb.ActorState_ACTOR_STATE_SUSPENDED: true,
-				ateapipb.ActorState_ACTOR_STATE_CRASHED:   true,
-				ateapipb.ActorState_ACTOR_STATE_DELETING:  true, // skipped
-			},
-		},
-		{
-			name:     "any_state delete",
-			anyState: true,
-			allowed: map[ateapipb.ActorState]bool{
-				ateapipb.ActorState_ACTOR_STATE_UNSPECIFIED: true,
-				ateapipb.ActorState_ACTOR_STATE_RUNNING:     true,
-				ateapipb.ActorState_ACTOR_STATE_RESUMING:    true,
-				ateapipb.ActorState_ACTOR_STATE_SUSPENDING:  true,
-				ateapipb.ActorState_ACTOR_STATE_SUSPENDED:   true,
-				ateapipb.ActorState_ACTOR_STATE_CRASHED:     true,
-				ateapipb.ActorState_ACTOR_STATE_REVERTING:   true,
-				ateapipb.ActorState_ACTOR_STATE_DELETING:    true, // skipped
-			},
-		},
-	}
+// TestEnsureMarkedDeleting_AllStates checks that every actor state can be
+// marked DELETING.
+func TestEnsureMarkedDeleting_AllStates(t *testing.T) {
+	for _, seedState := range allActorStates {
+		t.Run(seedState.String(), func(t *testing.T) {
+			ctx := context.Background()
+			st, cleanup := storetest.SetupTestStore(t)
+			defer cleanup()
+			w := newTestActorWorkflow(t, st, "ns", "tmpl1")
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			for _, seedState := range allActorStates {
-				ctx := context.Background()
-				st, cleanup := storetest.SetupTestStore(t)
-				w := newTestActorWorkflow(t, st, "ns", "tmpl1")
+			actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
+			seedWorkflowActor(t, ctx, st, actorRef, "ns", "tmpl1", seedState)
+			actor, err := st.GetActor(ctx, actorRef)
+			if err != nil {
+				t.Fatalf("get seeded actor: %v", err)
+			}
 
-				actorRef := resources.ActorRef{Atespace: "team-a", Name: "id1"}
-				seedWorkflowActor(t, ctx, st, actorRef, "ns", "tmpl1", seedState)
-				actor, err := st.GetActor(ctx, actorRef)
-				if err != nil {
-					t.Fatalf("state %v: get seeded actor: %v", seedState, err)
-				}
-
-				updated, err := w.ensureMarkedDeleting(ctx, actorRef, actor, tc.anyState)
-				assertPrerequisiteResult(t, seedState, err, tc.allowed[seedState])
-				if err == nil && seedState != ateapipb.ActorState_ACTOR_STATE_DELETING {
-					if updated.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_DELETING {
-						t.Errorf("state %v: ensureMarkedDeleting returned actor in %v, want DELETING", seedState, updated.GetStatus().GetState())
-					}
-				}
-				cleanup()
+			updated, err := w.ensureMarkedDeleting(ctx, actorRef, actor)
+			if err != nil {
+				t.Fatalf("ensureMarkedDeleting failed: %v", err)
+			}
+			if got := updated.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_DELETING {
+				t.Errorf("ensureMarkedDeleting returned actor in %v, want DELETING", got)
 			}
 		})
 	}
@@ -332,7 +262,7 @@ func TestDeleteActor_CollectsInFlightSnapshotWithoutTemplate(t *testing.T) {
 	ctx := context.Background()
 	persistence := newTestPersistence(t)
 	objects := objectstoretest.New()
-	w := NewActorWorkflow(persistence, nil, nil, nil, nil, nil, "", nil, objectstoreplugintest.ControlClient(objects))
+	w := NewActorWorkflow(persistence, nil, nil, nil, nil, nil, nil, "", nil, objectstoreplugintest.ControlClient(objects))
 
 	actorRef := resources.ActorRef{Atespace: "team-a", Name: "actor-1"}
 	actor := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
@@ -354,7 +284,7 @@ func TestDeleteActor_CollectsInFlightSnapshotWithoutTemplate(t *testing.T) {
 		}
 	})
 
-	if _, err := w.DeleteActor(ctx, actorRef, true, store.DeletePreconditions{}); err != nil {
+	if _, err := w.DeleteActor(ctx, actorRef, store.DeletePreconditions{}); err != nil {
 		t.Fatalf("DeleteActor: %v", err)
 	}
 	if left := objects.Prefix(t, inFlight.OwnerPrefix()); len(left) != 0 {
@@ -444,40 +374,21 @@ func TestDeleteActor_CollectsSnapshotsAfterWorkerDelete(t *testing.T) {
 			objects := objectstoretest.New()
 
 			actorRef := resources.ActorRef{Atespace: "team-a", Name: "actor-1"}
-			workerName := testWorkerUID("pod-1")
+			workerName := wireTestAssignment().GetWorker().GetName()
 			actor := storetest.MustCreateActor(t, ctx, persistence, &ateapipb.Actor{
 				Metadata:      &ateapipb.ResourceMetadata{Atespace: actorRef.Atespace, Name: actorRef.Name},
 				ActorTemplate: &ateapipb.ObjectRef{Atespace: "team-a", Name: "sub-tmpl"},
 				Status: &ateapipb.ActorStatus{
-					State: ateapipb.ActorState_ACTOR_STATE_RUNNING,
-					WorkerAssignment: &ateapipb.WorkerAssignment{
-						Worker:          &ateapipb.ObjectRef{Name: workerName},
-						WorkerNamespace: "worker-ns",
-						WorkerPool:      "pool",
-						WorkerPod:       "pod-1",
-						WorkerPodUid:    workerName,
-					},
+					State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+					WorkerAssignment: wireTestAssignment(),
 				},
 			})
-			if _, err := persistence.CreateWorker(ctx, &ateapipb.Worker{
-				Metadata:        &ateapipb.ResourceMetadata{Name: workerName},
-				WorkerNamespace: "worker-ns",
-				WorkerPool:      "pool",
-				WorkerPod:       "pod-1",
-				WorkerPodUid:    workerName,
-				Status:          &ateapipb.WorkerStatus{},
-			}); err != nil {
-				t.Fatalf("CreateWorker: %v", err)
-			}
-			seedAssignment(t, persistence, workerName, &ateapipb.ActorAssignment{
-				Actor:    &ateapipb.ObjectRef{Atespace: actorRef.Atespace, Name: actorRef.Name},
-				ActorUid: actor.GetMetadata().GetUid(),
-			})
+			seedWireWorker(t, ctx, persistence, assignmentOf(actor))
 
 			if tt.hasBeenSuspended {
 				previous := mustActorSnapshotURI(t, template, actor, "old")
 				objects.PutSnapshot(t, previous, "manifest.json")
-				actor = mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapipb.ActorStatus) {
+				mustUpdateActorStatus(t, ctx, persistence, actor, func(s *ateapipb.ActorStatus) {
 					s.LastAssignedGeneration = 1
 					s.Snapshots = []*ateapipb.Snapshot{
 						newDurableSnapshot(1, ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR, ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, "", previous.Name(), previous.String(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED),
@@ -485,21 +396,30 @@ func TestDeleteActor_CollectsSnapshotsAfterWorkerDelete(t *testing.T) {
 				})
 			}
 
-			actorWorkflow := NewActorWorkflow(persistence, nil, nil, nil, nil, nil, "", nil, objectstoreplugintest.ControlClient(objects))
-			// Suspend the actor as far as it gets: MarkSuspending mints the
-			// in-progress URI, and the checkpoint writes under it
-			actor, err := actorWorkflow.ensureMarkedSuspending(ctx, actorRef, actor, template)
-			if err != nil {
-				t.Fatalf("ensureMarkedSuspending: %v", err)
+			actorWorkflow, atelet := newWireCaptureWorkflow(t, persistence)
+			actorWorkflow.objectStorePlugin = objectstoreplugintest.ControlClient(objects)
+			// atelet writes part of the snapshot, then the worker's pod goes
+			// away mid-checkpoint, so the checkpoint fails and the suspend never
+			// commits.
+			var fresh resources.SnapshotURI
+			atelet.onCheckpoint = func(context.Context) error {
+				uri, err := resources.ParseSnapshotURI(atelet.checkpointRequest().GetSnapshot().GetObject().GetSnapshotUri())
+				if err != nil {
+					t.Errorf("ParseSnapshotURI: %v", err)
+					return err
+				}
+				fresh = uri
+				objects.PutSnapshot(t, fresh, "manifest.json")
+				// The worker's pod goes away with the commit still outstanding, so
+				// the suspend never gets to finish.
+				if _, err := NewWorkerWorkflow(persistence).DeleteWorker(ctx, workerName, store.DeletePreconditions{}); err != nil {
+					t.Errorf("DeleteWorker: %v", err)
+					return err
+				}
+				return apierror.Unavailable("worker pod is gone")
 			}
-			freshSnap := findLatestDurableSnapshot(actor.GetStatus(), ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING)
-			fresh := mustParseSnapshotURI(t, freshSnap.GetDurableSnapshot().GetObject().GetSnapshotUri())
-			objects.PutSnapshot(t, fresh, "manifest.json")
-
-			// The worker's pod goes away with the commit still outstanding, so
-			// the suspend never gets to finish.
-			if _, err := NewWorkerWorkflow(persistence).DeleteWorker(ctx, workerName, store.DeletePreconditions{}); err != nil {
-				t.Fatalf("DeleteWorker: %v", err)
+			if _, err := actorWorkflow.SuspendActor(ctx, actorRef, suspendSync); apierror.Code(err) != codes.Unavailable {
+				t.Fatalf("SuspendActor err = %v, want Unavailable from the failed checkpoint", err)
 			}
 
 			// The actor is CRASHED; DeleteActor deletes the in-progress snapshot
@@ -511,7 +431,7 @@ func TestDeleteActor_CollectsSnapshotsAfterWorkerDelete(t *testing.T) {
 			if got := stored.GetStatus().GetState(); got != ateapipb.ActorState_ACTOR_STATE_CRASHED {
 				t.Fatalf("state = %v, want CRASHED", got)
 			}
-			if _, err := actorWorkflow.DeleteActor(ctx, actorRef, true, store.DeletePreconditions{}); err != nil {
+			if _, err := actorWorkflow.DeleteActor(ctx, actorRef, store.DeletePreconditions{}); err != nil {
 				t.Fatalf("DeleteActor: %v", err)
 			}
 			if left := objects.Prefix(t, fresh.OwnerPrefix()); len(left) != 0 {
