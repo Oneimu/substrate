@@ -296,17 +296,29 @@ func (t *Tracker) nextDueLocked(a *actorSnapshots) (time.Time, bool) {
 	return due, ok
 }
 
-// requeueLocked queues the actor on each queue for when its next background
-// operation of that kind is due, if it has one, and on the prune queue if a
-// prune is due and can run (see queuePruneLocked), then drops the actor's entry
+// requeueLocked queues the actor's prune, if one is due and can run (see
+// queuePruneLocked), and then its next background upload or detach (see
+// requeueOpsLocked). Every change to an actor ends with it.
+func (t *Tracker) requeueLocked(a *actorSnapshots) {
+	if a.hold == holdTerminate {
+		// Forget drops the actor, or the terminate's end queues it again if it
+		// fails first (see holdLocked).
+		return
+	}
+	t.queuePruneLocked(a)
+	t.requeueOpsLocked(a)
+}
+
+// requeueOpsLocked queues the actor on each queue for when its next background
+// operation of that kind is due, if it has one, then drops the actor's entry
 // from memory unless the entry has an operation, a prune, or a Run, Restore,
 // Checkpoint, PromoteSnapshot, or Terminate, in progress, a retry hold, a
 // failed upload kept to retry, or a change that failed to save. An entry whose
 // Uploading is superseded is queued at once on the upload queue and kept in
 // memory until an upload worker cleans it up. A save that finds the actor's
-// directory gone leaves nothing unsaved. requeueLocked runs after a change to
-// the actor is saved, so it must not change what the snapshot state file keeps.
-func (t *Tracker) requeueLocked(a *actorSnapshots) {
+// directory gone leaves nothing unsaved. It runs after a change to the actor is
+// saved, so it must not change what the snapshot state file keeps.
+func (t *Tracker) requeueOpsLocked(a *actorSnapshots) {
 	if a.hold == holdTerminate {
 		// Forget drops the actor, or the terminate's end queues it again if it
 		// fails first (see holdLocked).
@@ -326,8 +338,7 @@ func (t *Tracker) requeueLocked(a *actorSnapshots) {
 	if due, ok := t.detachDueLocked(a); ok {
 		t.queues[opDetach].AddAfter(a.actorUID, due.Sub(now))
 	}
-	t.queuePruneLocked(a)
-	if !supersededUploading && a.op == nil && a.pruning == nil && a.hold == holdNone && a.retryAt.IsZero() && a.pruneRetryAt.IsZero() && !a.uploadingFailed && !a.unsaved {
+	if !supersededUploading && a.op == nil && a.pruning == nil && a.hold == holdNone && a.retryAt.IsZero() && !a.uploadingFailed && !a.unsaved {
 		t.dropLocked(a.actorUID)
 	}
 }

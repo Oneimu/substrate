@@ -19,42 +19,30 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
-	"time"
 
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/utils/clock"
 )
 
-// Prune settings.
-const (
-	// pruneWorkers is how many prunes run at once on a node.
-	pruneWorkers = 2
-	// pruneRetryDelay is how long atelet holds an actor's prune back after an
-	// attempt failed. Each further consecutive failure doubles it, up to
-	// maxPruneRetryDelay.
-	pruneRetryDelay    = 5 * time.Second
-	maxPruneRetryDelay = 5 * time.Minute
-)
+// pruneWorkers is how many prunes run at once on a node.
+const pruneWorkers = 2
 
-// pruneQueue holds the queue and settings for deleting the local snapshots
-// that a commit superseded (see actorSnapshotsRecord.Prune). Prunes touch only
-// the node's disk, so they have a queue, workers, and retry backoff of their
-// own, apart from uploads and detaches.
+// pruneQueue holds the queue and workers for deleting the local snapshots that
+// a commit superseded (see actorSnapshotsRecord.Prune). Prunes touch only the
+// node's disk, so they have a queue and workers of their own, apart from
+// uploads and detaches. A prune that fails has no retry timer: the snapshot
+// stays listed, and the actor's next state change, Checkpoint, Detach, or
+// Terminate tries again.
 type pruneQueue struct {
 	// workers is how many prune workers drain queue.
 	workers int
 	// queue holds the UIDs of actors with a prune due.
-	queue workqueue.TypedDelayingInterface[string]
-	// retries says how long an actor's prune is held back after a failure:
-	// longer with each consecutive failure for the actor.
-	retries workqueue.TypedRateLimiter[string]
+	queue workqueue.TypedInterface[string]
 }
 
-func newPruneQueue(clk clock.WithTicker) pruneQueue {
+func newPruneQueue() pruneQueue {
 	return pruneQueue{
 		workers: pruneWorkers,
-		queue:   workqueue.NewTypedDelayingQueueWithConfig(workqueue.TypedDelayingQueueConfig[string]{Clock: clk}),
-		retries: workqueue.NewTypedItemExponentialFailureRateLimiter[string](pruneRetryDelay, maxPruneRetryDelay),
+		queue:   workqueue.NewTyped[string](),
 	}
 }
 
@@ -100,25 +88,15 @@ func (a *actorSnapshots) pruneDue() bool {
 	return len(a.pruneTargets()) > 0
 }
 
-// clearPruneLocked records that the actor has no local snapshot left to prune,
-// as after a detach deleted them all, and resets the prune backoff. The
-// caller saves the actor's state.
-func (t *Tracker) clearPruneLocked(a *actorSnapshots) {
-	a.Prune = nil
-	a.pruneRetryAt = time.Time{}
-	t.pruning.retries.Forget(a.actorUID)
-}
-
 // queuePruneLocked queues the actor's prune, if one is due and can run: no
 // Run, Restore, Checkpoint, PromoteSnapshot, or Terminate holds the actor,
 // and no prune or detach of it is in progress. Each of those queues the actor
-// again when it ends. A prune held back by a failure is queued for when its
-// backoff passes.
+// again when it ends.
 func (t *Tracker) queuePruneLocked(a *actorSnapshots) {
 	if a.hold != holdNone || a.pruning != nil || a.runningDetach() != nil || !a.pruneDue() {
 		return
 	}
-	t.pruning.queue.AddAfter(a.actorUID, a.pruneRetryAt.Sub(t.clock.Now()))
+	t.pruning.queue.Add(a.actorUID)
 }
 
 // beginPruneLocked begins a prune of the actor's listed local snapshots,
@@ -136,11 +114,12 @@ func (t *Tracker) beginPruneLocked(ctx context.Context, a *actorSnapshots) func(
 }
 
 // finishPrune runs op: it deletes each of op.uuids, and drops the ones deleted
-// from the actor's list. A snapshot it could not delete stays listed, and the
-// prune is retried after a backoff, unless Forget or an atelet shutdown
-// canceled it. A snapshot that is missing already counts as deleted.
-// pruneTargets left out a listed snapshot an upload still reads, so op.uuids
-// never names one.
+// from the actor's list. A snapshot it could not delete stays listed for a
+// later attempt: the actor's next state change, Checkpoint, Detach, or
+// Terminate, not a retry at once, which would spin on a disk that keeps
+// failing. A snapshot that became deletable meanwhile is queued now. A
+// snapshot that is missing already counts as deleted. pruneTargets left out a
+// listed snapshot an upload still reads, so op.uuids never names one.
 func (t *Tracker) finishPrune(ctx context.Context, actorUID string, op *pruneOp) error {
 	defer close(op.done)
 	defer op.cancel()
@@ -165,24 +144,13 @@ func (t *Tracker) finishPrune(ctx context.Context, actorUID string, op *pruneOp)
 	// The entry stays in memory while the prune runs, and Forget waits for
 	// the prune to end before dropping it.
 	t.lock(actorUID)
+	defer t.unlock(actorUID)
 	a := t.findLocked(actorUID)
 	a.pruning = nil
 	if len(deleted) > 0 {
 		a.Prune = slices.DeleteFunc(a.Prune, func(uuid string) bool { return slices.Contains(deleted, uuid) })
-	}
-	switch {
-	case err == nil:
-		a.pruneRetryAt = time.Time{}
-		t.pruning.retries.Forget(actorUID)
-	case ctx.Err() == nil:
-		a.pruneRetryAt = t.clock.Now().Add(t.pruning.retries.When(actorUID))
-	}
-	if len(deleted) > 0 {
 		t.saveLocked(a)
 	}
-	t.requeueLocked(a)
-	t.unlock(actorUID)
-
 	attrs := []any{slog.String("actorUID", actorUID), slog.Any("deleted", deleted), slog.Duration("took", t.clock.Since(start))}
 	switch {
 	case err == nil:
@@ -192,7 +160,12 @@ func (t *Tracker) finishPrune(ctx context.Context, actorUID string, op *pruneOp)
 		slog.InfoContext(ctx, "Prune of the actor's superseded local snapshots canceled", append(attrs, slog.Any("err", err))...)
 	default:
 		slog.WarnContext(ctx, "Failed to prune the actor's superseded local snapshots", append(attrs, slog.Any("err", err))...)
+		if !slices.ContainsFunc(a.pruneTargets(), func(uuid string) bool { return !slices.Contains(op.uuids, uuid) }) {
+			t.requeueOpsLocked(a)
+			return err
+		}
 	}
+	t.requeueLocked(a)
 	return err
 }
 
@@ -217,18 +190,7 @@ func (t *Tracker) prune(actorUID string) {
 		return
 	}
 	a := t.findLocked(actorUID)
-	if a == nil || !a.pruneDue() {
-		t.pruning.retries.Forget(actorUID)
-		t.unlock(actorUID)
-		return
-	}
-	if a.hold != holdNone || a.pruning != nil || a.runningDetach() != nil {
-		t.unlock(actorUID)
-		return
-	}
-	if a.pruneRetryAt.After(t.clock.Now()) {
-		// Queued before the last failure set the backoff: wait it out.
-		t.queuePruneLocked(a)
+	if a == nil || !a.pruneDue() || a.hold != holdNone || a.pruning != nil || a.runningDetach() != nil {
 		t.unlock(actorUID)
 		return
 	}

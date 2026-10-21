@@ -85,8 +85,9 @@ type Store interface {
 //     prune deletes only listed snapshots, so a state file that lags memory
 //     never costs a snapshot it does not name. A Checkpoint that finds a
 //     prune still due runs it before it writes, so an actor whose disk falls
-//     behind waits on its own pause rather than pile snapshots up. Prunes
-//     retry with a backoff of their own, apart from uploads and detaches.
+//     behind waits on its own pause rather than pile snapshots up. A prune
+//     that fails leaves the snapshot listed for the actor's next state
+//     change, Checkpoint, Detach, or Terminate to try again.
 //  6. A Run or Restore unschedules the actor's detach as it begins
 //     (BeginStart), and saves that before the workload can start, so atelet
 //     does not detach an actor whose start has begun, even after a restart or
@@ -334,7 +335,7 @@ func New(ctx context.Context, store Store, clk clock.WithTicker, opts ...Option)
 		retries:             workqueue.NewTypedItemExponentialFailureRateLimiter[string](snapshotRetryDelay, maxSnapshotRetryDelay),
 		workers:             [numOpKinds]int{opUpload: DefaultUploadWorkers, opDetach: DefaultDetachWorkers},
 		reporting:           newReportQueue(clk),
-		pruning:             newPruneQueue(clk),
+		pruning:             newPruneQueue(),
 		removeLocalSnapshot: removeLocalCheckpoint,
 		locks:               actorlock.New(),
 		actors:              map[string]*actorSnapshots{},

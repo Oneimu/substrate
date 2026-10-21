@@ -269,9 +269,8 @@ func TestPruneRunsWhileAnUploadIsInFlight(t *testing.T) {
 }
 
 // A checkpoint whose inline prune fails makes one attempt and goes on to hold
-// the actor; the prune is retried in the background once its backoff has
-// passed, no sooner even if a worker finds the actor queued from before the
-// failure, and the actor's entry is dropped once it succeeds.
+// the actor. The snapshot stays listed, a worker does not retry it at once,
+// and the next change to the actor, here the checkpoint's end, tries again.
 func TestBeginCheckpointMakesOnePruneAttemptWhenItFails(t *testing.T) {
 	tr := newIdleTestTracker(t, nil) // workers not started
 	calls := failRemovals(tr)
@@ -280,26 +279,30 @@ func TestBeginCheckpointMakesOnePruneAttemptWhenItFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginCheckpoint: %v", err)
 	}
-	end()
 	if n := calls.Load(); n != 1 {
 		t.Errorf("BeginCheckpoint tried the failing prune %d times, want 1", n)
 	}
 	if !localSnapshotExists("s1") || !pruneDue(tr) {
 		t.Fatal("a failed prune left s1 deleted or no prune due")
 	}
+	end()
 
-	restoreRemovals(tr)
-	// The second pause queued the actor before the failure set its backoff:
-	// a worker that takes it now waits the backoff out rather than retry.
-	stepTo(tr, tr.clock.Now().Add(pruneRetryDelay-time.Second))
+	// The second pause queued the actor before the failure. The worker's
+	// attempt fails too, and the actor is not queued again by the failure.
 	processNextPrune(t, tr)
-	if !localSnapshotExists("s1") {
-		t.Fatal("the prune was retried before its backoff passed")
+	if n := calls.Load(); n != 2 {
+		t.Errorf("the worker tried the failing prune %d times in total, want 2", n)
 	}
-	stepTo(tr, tr.clock.Now().Add(time.Second))
+	if got := tr.pruning.queue.Len(); got != 0 {
+		t.Errorf("prune queue holds %d actors after a failed prune, want 0: a failure must not queue a retry at once", got)
+	}
+
+	// The next change to the actor queues it again, and the prune succeeds.
+	restoreRemovals(tr)
+	commitLocalSnapshot(t, tr, "s3", 3)
 	processNextPrune(t, tr)
-	if localSnapshotExists("s1") {
-		t.Error("the prune was not retried once its backoff passed")
+	if localSnapshotExists("s1") || localSnapshotExists("s2") || !localSnapshotExists("s3") {
+		t.Errorf("after the retry: s1 exists = %v, s2 exists = %v, s3 exists = %v; want only s3", localSnapshotExists("s1"), localSnapshotExists("s2"), localSnapshotExists("s3"))
 	}
 	if pruneDue(tr) || inMemory(tr) {
 		t.Errorf("after the retry: prune due = %v, in memory = %v; want neither", pruneDue(tr), inMemory(tr))
@@ -338,7 +341,7 @@ func TestForgetWaitsForARunningPrune(t *testing.T) {
 }
 
 // A prune does not run while a Run, Restore, Checkpoint, or PromoteSnapshot
-// holds the actor, even once its backoff has passed: the hold's end queues it.
+// holds the actor: the hold's end queues it.
 func TestPruneDefersWhileTheActorIsHeld(t *testing.T) {
 	tr := newIdleTestTracker(t, nil) // workers not started
 	calls := failRemovals(tr)
@@ -351,8 +354,7 @@ func TestPruneDefersWhileTheActorIsHeld(t *testing.T) {
 		t.Fatalf("BeginCheckpoint tried the failing prune %d times, want 1", n)
 	}
 	restoreRemovals(tr)
-	stepTo(tr, tr.clock.Now().Add(pruneRetryDelay))
-	processNextPrune(t, tr)
+	processNextPrune(t, tr) // queued by the second pause; the hold defers it
 	if !localSnapshotExists("s1") {
 		t.Fatal("a prune ran while a Checkpoint held the actor")
 	}

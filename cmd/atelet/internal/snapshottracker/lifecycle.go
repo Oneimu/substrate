@@ -275,8 +275,8 @@ func (t *Tracker) BeginCheckpoint(ctx context.Context, actorUID string, snap *at
 	if a != nil && a.hold == holdNone && a.pruneDue() {
 		// Run a prune still due before writing another snapshot, so the
 		// superseded snapshots an actor keeps do not pile up while its disk
-		// falls behind: one pause waits for one prune. One attempt: a failure
-		// is retried in the background, and the checkpoint goes on. The prune
+		// falls behind: one pause waits for one prune. One attempt: after a
+		// failure the snapshot stays listed, and the checkpoint goes on. The prune
 		// deletes only listed snapshots, so LatestLocal survives until the
 		// new commit supersedes it; a crash before then leaves a paused actor
 		// restorable from it on this node.
@@ -410,7 +410,6 @@ func (t *Tracker) Forget(actorUID string) error {
 	}
 	t.retries.Forget(actorUID)
 	t.reporting.retries.Forget(actorUID)
-	t.pruning.retries.Forget(actorUID)
 	t.dropLocked(actorUID)
 	t.undurableActorsTally.forget(actorUID)
 	return removeSnapshotState(actorUID)
@@ -432,7 +431,7 @@ func (t *Tracker) clearLatestLocalLocked(a *actorSnapshots) {
 	a.UndurableSince = time.Time{}
 	a.clearLatestLocal()
 	t.resetBackoffLocked(a)
-	t.clearPruneLocked(a)
+	a.Prune = nil
 }
 
 // durableCommittedLocked finishes CommitDurable or CommitPromoted once

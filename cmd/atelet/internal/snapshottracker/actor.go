@@ -236,9 +236,6 @@ type actorSnapshots struct {
 	// BeginCheckpoint, or BeginStart runs it. The entry stays in memory while
 	// pruning is set.
 	pruning *pruneOp
-	// pruneRetryAt holds the actor's next prune back after one failed. The
-	// entry stays in memory while pruneRetryAt is set.
-	pruneRetryAt time.Time
 	// reportDeferred is set when a report of the actor's state is held back
 	// while hold is set, so holdLocked queues it once the RPC ends.
 	reportDeferred bool
