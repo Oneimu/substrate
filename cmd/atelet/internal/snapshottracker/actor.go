@@ -177,15 +177,14 @@ type actorSnapshotsRecord struct {
 	// (CommitLocal or CommitDurable). While it is unset, the actor's
 	// directories and volumes are still that Checkpoint's to clean up.
 	Started bool `json:"started,omitempty"`
-	// Prune names the local snapshots to delete that a prune has not deleted
-	// yet, oldest first: those a commit superseded, each listed in the save
-	// that records the commit superseding it, so a state file that lags memory
-	// never lists a snapshot a later commit recorded; and a copy a Checkpoint
-	// left behind without committing it, listed when the Checkpoint ends. An
-	// atelet restart finishes the prune. A prune deletes only these, never a
-	// snapshot it does not list, and a listed snapshot is never committed
-	// again: commits refuse an older generation, and a Checkpoint whose first
-	// attempt left a copy cannot checkpoint the workload a second time.
+	// Prune names the local snapshots a commit superseded that a prune has not
+	// deleted yet, oldest first. Each is listed in the save that records the
+	// commit superseding it, so a state file that lags memory never lists a
+	// snapshot a later commit recorded, and an atelet restart finishes the
+	// prune. A prune deletes only these, never a snapshot it does not list,
+	// and a listed snapshot is never committed again: commits refuse an older
+	// generation, and a retried Checkpoint is answered from the snapshot it
+	// committed rather than checkpointed again.
 	Prune []string `json:"prune,omitempty"`
 	// ReportDueSince is when the latest background change atelet owes a
 	// report of (a new LatestDurable, or local snapshots cleared by a
@@ -237,9 +236,6 @@ type actorSnapshots struct {
 	// BeginCheckpoint, or BeginStart runs it. The entry stays in memory while
 	// pruning is set.
 	pruning *pruneOp
-	// pruneRetryAt holds the actor's next prune back after one failed. The
-	// entry stays in memory while pruneRetryAt is set.
-	pruneRetryAt time.Time
 	// reportDeferred is set when a report of the actor's state is held back
 	// while hold is set, so holdLocked queues it once the RPC ends.
 	reportDeferred bool

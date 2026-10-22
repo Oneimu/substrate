@@ -85,8 +85,9 @@ type Store interface {
 //     prune deletes only listed snapshots, so a state file that lags memory
 //     never costs a snapshot it does not name. A Checkpoint that finds a
 //     prune still due runs it before it writes, so an actor whose disk falls
-//     behind waits on its own pause rather than pile snapshots up. Prunes
-//     retry with a backoff of their own, apart from uploads and detaches.
+//     behind waits on its own pause rather than pile snapshots up. A prune
+//     that fails leaves the snapshot listed for the actor's next state
+//     change, Checkpoint, Detach, or Terminate to try again.
 //  6. A Run or Restore unschedules the actor's detach as it begins
 //     (BeginStart), and saves that before the workload can start, so atelet
 //     does not detach an actor whose start has begun, even after a restart or
@@ -118,25 +119,25 @@ type Store interface {
 // The first table shows how each RPC on an actor treats the actor's upload,
 // detach, or prune in progress, and its report due. The RPC waits for the
 // operation to end as it begins (BeginStart, BeginCheckpoint, BeginPromote, or
-// Detach), waits only if the operation is on the snapshot the RPC reads,
-// cancels it and waits for it to stop, or leaves it alone (-). A Checkpoint or
-// PromoteSnapshot cancels once it commits its snapshot, and Terminate cancels
-// in Forget, once the workload is gone. A canceled report is neither sent nor
-// retried, though an attempt under way finishes.
+// Detach), cancels it and waits for it to stop, or leaves it alone (-). A
+// Checkpoint or PromoteSnapshot cancels once it commits its snapshot, and
+// Terminate cancels in Forget, once the workload is gone. A canceled report is
+// neither sent nor retried, though an attempt under way finishes.
 //
-//	RPC                   upload        detach   prune        report due
-//	Run                   -             waits    -            -
-//	Restore               -             waits    if of the    -
-//	                                             snapshot
-//	deferred Checkpoint   -             waits    waits        cancels
-//	immediate Checkpoint  cancels       waits    waits        cancels
-//	PromoteSnapshot       if of the     waits    if of the    cancels if a
-//	                      snapshot,              snapshot     local snapshot
-//	                      else cancels                        is kept
-//	DetachActor           waits         waits    waits        keeps, and its
-//	                                                          detach makes
-//	                                                          one due
-//	Terminate             cancels       cancels  cancels      cancels
+//	RPC                   upload        detach   prune    report due
+//	Run, Restore          -             waits    -        -
+//	deferred Checkpoint   -             waits    waits    cancels
+//	immediate Checkpoint  cancels       waits    waits    cancels
+//	PromoteSnapshot       waits if the  waits    -        cancels if a
+//	                      same snapshot,                  local snapshot
+//	                      else cancels                    is kept
+//	DetachActor           waits         waits    waits    keeps, and its
+//	                                                      detach makes
+//	                                                      one due
+//	Terminate             cancels       cancels  cancels  cancels
+//
+// A Restore does not read a snapshot listed to prune in place (see
+// BeginStart); it reads the durable copy instead.
 //
 // The second table shows whether an upload, detach, prune, or report of the
 // actor that comes due while an RPC or background work of the actor runs
@@ -343,7 +344,7 @@ func New(ctx context.Context, store Store, clk clock.WithTicker, opts ...Option)
 		retries:             workqueue.NewTypedItemExponentialFailureRateLimiter[string](snapshotRetryDelay, maxSnapshotRetryDelay),
 		workers:             [numOpKinds]int{opUpload: DefaultUploadWorkers, opDetach: DefaultDetachWorkers},
 		reporting:           newReportQueue(clk),
-		pruning:             newPruneQueue(clk),
+		pruning:             newPruneQueue(),
 		removeLocalSnapshot: removeLocalCheckpoint,
 		locks:               actorlock.New(),
 		actors:              map[string]*actorSnapshots{},

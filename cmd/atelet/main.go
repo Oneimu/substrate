@@ -791,9 +791,8 @@ func (s *Atelet) Run(ctx context.Context, req *ateletpb.RunRequest) (resp *atele
 		return nil, err
 	}
 	defer unlockActor()
-	// A detach in progress finishes first. Run reads no snapshot, so it does
-	// not wait for a prune.
-	endStart, err := s.snapshots.BeginStart(ctx, actorUID, "")
+	// A detach in progress finishes first. Run reads no snapshot.
+	_, endStart, err := s.snapshots.BeginStart(ctx, actorUID, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1462,6 +1461,10 @@ func (st *trackerStore) UploadLocalSnapshot(ctx context.Context, actorUID string
 // interrupted prune can leave. File contents and sizes are not checked.
 var errUnusableLocalSnapshot = errors.New("unusable local snapshot")
 
+// errListedLocalSnapshot is the reason a Restore does not read a local
+// snapshot that is listed to prune (see snapshottracker.Tracker.BeginStart).
+var errListedLocalSnapshot = errors.New("local snapshot is listed to prune")
+
 // readLocalSnapshot returns the manifest of the node-local snapshot in
 // localDir once every file it lists is present. A missing manifest reports
 // os.ErrNotExist, and any other failure wraps errUnusableLocalSnapshot.
@@ -1553,9 +1556,10 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 	defer unlockActor()
 
 	// A detach in progress finishes first. If it ran, its local copy is gone,
-	// and the restore reads snapshot.object. A prune of the requested snapshot
-	// finishes first too; one of other snapshots runs on.
-	endStart, err := s.snapshots.BeginStart(ctx, actorUID, req.GetSnapshot().GetSnapshotUuid())
+	// and the restore reads snapshot.object. useLocal is false while the
+	// snapshot is listed to prune: the restore then reads snapshot.object too,
+	// rather than a local copy a prune deletes under the running workload.
+	useLocal, endStart, err := s.snapshots.BeginStart(ctx, actorUID, req.GetSnapshot().GetSnapshotUuid())
 	if err != nil {
 		return nil, err
 	}
@@ -1610,7 +1614,11 @@ func (s *Atelet) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (res
 		}
 	}()
 	var sandboxRec *sandboxAssetsRecord
-	localRec, localErr := readLocalSnapshot(localDir)
+	var localRec *sandboxAssetsRecord
+	localErr := errListedLocalSnapshot
+	if useLocal {
+		localRec, localErr = readLocalSnapshot(localDir)
+	}
 	durable := req.GetSnapshot().GetObject()
 	if localErr == nil {
 		directLocal = true
@@ -1798,7 +1806,7 @@ func (s *Atelet) Terminate(ctx context.Context, req *ateletpb.TerminateRequest) 
 	}
 	defer unlockActor()
 	// No background work on the actor starts while it is being terminated.
-	// Forget below cancels an upload or detach already in progress.
+	// Forget below cancels an upload, detach, or prune already in progress.
 	endTerminate := s.snapshots.BeginTerminate(actorUID)
 	defer endTerminate()
 

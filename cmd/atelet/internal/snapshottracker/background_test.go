@@ -193,7 +193,7 @@ func TestStartQueuesActorsWithSnapshotState(t *testing.T) {
 	before := New(t.Context(), newFakeSnapshotStore(), clocktesting.NewFakeClock(t0), WithUploadDelay(testUploadDelay), WithDetachDelay(testDetachDelay))
 	before.CommitLocal("actor-both", testRef("s1", 1, t0))
 	before.CommitLocal("actor-upload", testRef("s2", 1, t0))
-	endStart, err := before.BeginStart(t.Context(), "actor-upload", "")
+	_, endStart, err := before.BeginStart(t.Context(), "actor-upload", "")
 	if err != nil {
 		t.Fatalf("BeginStart: %v", err)
 	}

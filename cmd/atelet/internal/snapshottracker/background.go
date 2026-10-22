@@ -297,17 +297,29 @@ func (t *Tracker) nextDueLocked(a *actorSnapshots) (time.Time, bool) {
 	return due, ok
 }
 
-// requeueLocked queues the actor on each queue for when its next background
-// operation of that kind is due, if it has one, and on the prune queue if a
-// prune is due and can run (see queuePruneLocked), then drops the actor's entry
+// requeueLocked queues the actor's prune, if one is due and can run (see
+// queuePruneLocked), and then its next background upload or detach (see
+// requeueOpsLocked). Every change to an actor ends with it.
+func (t *Tracker) requeueLocked(a *actorSnapshots) {
+	if a.hold == holdTerminate {
+		// Forget drops the actor, or the terminate's end queues it again if it
+		// fails first (see holdLocked).
+		return
+	}
+	t.queuePruneLocked(a)
+	t.requeueOpsLocked(a)
+}
+
+// requeueOpsLocked queues the actor on each queue for when its next background
+// operation of that kind is due, if it has one, then drops the actor's entry
 // from memory unless the entry has an operation, a prune, or a Run, Restore,
 // Checkpoint, PromoteSnapshot, or Terminate, in progress, a retry hold, a
 // failed upload kept to retry, or a change that failed to save. An entry whose
 // Uploading is superseded is queued at once on the upload queue and kept in
 // memory until an upload worker cleans it up. A save that finds the actor's
-// directory gone leaves nothing unsaved. requeueLocked runs after a change to
-// the actor is saved, so it must not change what the snapshot state file keeps.
-func (t *Tracker) requeueLocked(a *actorSnapshots) {
+// directory gone leaves nothing unsaved. It runs after a change to the actor is
+// saved, so it must not change what the snapshot state file keeps.
+func (t *Tracker) requeueOpsLocked(a *actorSnapshots) {
 	if a.hold == holdTerminate {
 		// Forget drops the actor, or the terminate's end queues it again if it
 		// fails first (see holdLocked).
@@ -327,8 +339,7 @@ func (t *Tracker) requeueLocked(a *actorSnapshots) {
 	if due, ok := t.detachDueLocked(a); ok {
 		t.queues[opDetach].AddAfter(a.actorUID, due.Sub(now))
 	}
-	t.queuePruneLocked(a)
-	if !supersededUploading && a.op == nil && a.pruning == nil && a.hold == holdNone && a.retryAt.IsZero() && a.pruneRetryAt.IsZero() && !a.uploadingFailed && !a.unsaved {
+	if !supersededUploading && a.op == nil && a.pruning == nil && a.hold == holdNone && a.retryAt.IsZero() && !a.uploadingFailed && !a.unsaved {
 		t.dropLocked(a.actorUID)
 	}
 }
@@ -419,14 +430,14 @@ func (t *Tracker) waitIdleLocked(ctx context.Context, actorUID string) (*actorSn
 }
 
 // waitForDetachLocked waits, as long as ctx allows, until no detach of the
-// actor is in progress, nor a prune that prune reports it should wait for
-// (anyPrune, or pruneOf one snapshot), and returns the actor's entry, which
-// may be nil. It releases the actor's lock while it waits, and holds it again
-// when it returns. check, if not nil, vets the entry on every pass: an error
-// from it is returned at once, without waiting further. Checkpoint, Run, and
-// Restore call this first so they never race with a detach or a prune deleting
-// a snapshot they read or write, without waiting behind an upload.
-func (t *Tracker) waitForDetachLocked(ctx context.Context, actorUID string, check func(*actorSnapshots) error, prune func(*pruneOp) bool) (*actorSnapshots, error) {
+// actor is in progress, nor a prune when prune is set, and returns the actor's
+// entry, which may be nil. It releases the actor's lock while it waits, and
+// holds it again when it returns. check, if not nil, vets the entry on every
+// pass: an error from it is returned at once, without waiting further.
+// Checkpoint, Run, and Restore call this first so they never race with a detach
+// or a prune deleting a snapshot they read or write, without waiting behind an
+// upload.
+func (t *Tracker) waitForDetachLocked(ctx context.Context, actorUID string, check func(*actorSnapshots) error, prune bool) (*actorSnapshots, error) {
 	for {
 		a := t.findLocked(actorUID)
 		if a != nil && check != nil {
@@ -441,7 +452,7 @@ func (t *Tracker) waitForDetachLocked(ctx context.Context, actorUID string, chec
 		switch {
 		case a.runningDetach() != nil:
 			err = t.waitOpLocked(ctx, actorUID, a.op)
-		case a.pruning != nil && prune(a.pruning):
+		case prune && a.pruning != nil:
 			err = t.waitForPruneLocked(ctx, actorUID, a.pruning)
 		default:
 			return a, nil
@@ -470,16 +481,10 @@ func (t *Tracker) waitForDetachOrSnapshotUploadLocked(ctx context.Context, actor
 		if a == nil {
 			return nil, nil
 		}
-		var err error
-		switch {
-		case a.op != nil && (a.op.kind == opDetach || sameUUID(&a.op.target, &snap)):
-			err = t.waitOpLocked(ctx, actorUID, a.op)
-		case a.pruning.deletes(snap.uuid()):
-			err = t.waitForPruneLocked(ctx, actorUID, a.pruning)
-		default:
+		if a.op == nil || (a.op.kind == opUpload && !sameUUID(&a.op.target, &snap)) {
 			return a, nil
 		}
-		if err != nil {
+		if err := t.waitOpLocked(ctx, actorUID, a.op); err != nil {
 			return nil, err
 		}
 	}

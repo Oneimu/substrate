@@ -590,7 +590,7 @@ func TestTrackerCommitPromotedKeepsDetachSchedule(t *testing.T) {
 			tr.CommitLocal(trackedActorUID, paused)
 			want := tr.clock.Now().Add(testDetachDelay)
 			if started {
-				end, err := tr.BeginStart(t.Context(), trackedActorUID, "")
+				_, end, err := tr.BeginStart(t.Context(), trackedActorUID, "")
 				if err != nil {
 					t.Fatalf("beginStart: %v", err)
 				}
@@ -978,7 +978,7 @@ func TestTrackerNotStartedSince(t *testing.T) {
 		return func(_ *testing.T, tr *Tracker) { tr.CommitDurable(trackedActorUID, r) }
 	}
 	start := func(t *testing.T, tr *Tracker) {
-		end, err := tr.BeginStart(t.Context(), trackedActorUID, "")
+		_, end, err := tr.BeginStart(t.Context(), trackedActorUID, "")
 		if err != nil {
 			t.Fatalf("BeginStart: %v", err)
 		}

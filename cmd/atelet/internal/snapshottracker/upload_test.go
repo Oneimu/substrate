@@ -574,7 +574,7 @@ func TestTrackerStartKeepsUploadBackoff(t *testing.T) {
 	uploadNow(t, tr, store, errors.New("boom"))
 	retryAt := tr.clock.Now().Add(testRetryDelay)
 
-	end, err := tr.BeginStart(t.Context(), trackedActorUID, "")
+	_, end, err := tr.BeginStart(t.Context(), trackedActorUID, "")
 	if err != nil {
 		t.Fatalf("BeginStart: %v", err)
 	}
@@ -610,7 +610,8 @@ func TestTrackerStartAndCheckpointDoNotWaitForUpload(t *testing.T) {
 		begin func(context.Context, string) (func(), error)
 	}{
 		{"BeginStart", func(ctx context.Context, uid string) (func(), error) {
-			return tr.BeginStart(ctx, uid, "")
+			_, end, err := tr.BeginStart(ctx, uid, "")
+			return end, err
 		}},
 		{"BeginCheckpoint deferred", beginCheckpoint(ateletpb.UploadMode_UPLOAD_MODE_DEFERRED)},
 		{"BeginCheckpoint immediate", beginCheckpoint(ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE)},
@@ -983,7 +984,7 @@ func TestTrackerKeepsSupersededCopyWhileHeld(t *testing.T) {
 		done := startUpload(t, tr, store)
 		tr.CommitLocal(trackedActorUID, testRef("s2", 2, tr.clock.Now()))
 
-		end, err := tr.BeginStart(t.Context(), trackedActorUID, "")
+		_, end, err := tr.BeginStart(t.Context(), trackedActorUID, "")
 		if err != nil {
 			t.Fatalf("BeginStart: %v", err)
 		}
@@ -1012,7 +1013,7 @@ func TestTrackerKeepsSupersededCopyWhileHeld(t *testing.T) {
 		processNext(t, tr, opUpload) // s1's upload fails, and s1 waits in Uploading to retry.
 		tr.CommitDurable(trackedActorUID, testRef("s2", 2, tr.clock.Now()))
 
-		end, err := tr.BeginStart(t.Context(), trackedActorUID, "")
+		_, end, err := tr.BeginStart(t.Context(), trackedActorUID, "")
 		if err != nil {
 			t.Fatalf("BeginStart: %v", err)
 		}
@@ -1028,10 +1029,10 @@ func TestTrackerKeepsSupersededCopyWhileHeld(t *testing.T) {
 }
 
 // While Terminate holds the actor, no upload worker clears a superseded
-// Uploading snapshot or deletes its local copy: Terminate prunes the actor's
-// local snapshots once Forget drops it. If the terminate fails before Forget,
-// its end lets a worker clear the snapshot, which deletes the copy before
-// releasing the actor's lock.
+// Uploading snapshot and no prune deletes its local copy: Terminate prunes the
+// actor's local snapshots once Forget drops it. If the terminate fails before
+// Forget, its end lets a worker clear the snapshot, and a prune deletes the
+// copy afterwards.
 func TestTrackerTerminateHoldsOffSupersededUploadingCleanup(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

@@ -23,10 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"google.golang.org/grpc/codes"
-
 	"go.ate.dev/substrate/cmd/atelet/internal/ateletpath"
-	"go.ate.dev/substrate/internal/apierror"
 	"go.ate.dev/substrate/internal/proto/ateletpb"
 )
 
@@ -197,46 +194,6 @@ func TestBeginCheckpointRunsAQueuedPruneFirst(t *testing.T) {
 	}
 }
 
-// A Restore of the snapshot a prune is deleting, as after a revert to an older
-// generation, waits for the prune, so it does not read a directory being
-// emptied. A Run, or a Restore of the latest snapshot, which no prune deletes,
-// does not wait.
-func TestBeginStartWaitsForAPruneOfItsSnapshotOnly(t *testing.T) {
-	tr := newIdleTestTracker(t, nil)
-	started, release := blockRemovals(tr)
-	tr.Start()
-	commitLocalSnapshots(t, tr, "s1", "s2")
-	<-started // a worker is deleting s1, held open
-
-	for _, uuid := range []string{"", "s2"} {
-		end, err := tr.BeginStart(t.Context(), trackedActorUID, uuid)
-		if err != nil {
-			t.Fatalf("BeginStart(%q) during a prune of s1: %v", uuid, err)
-		}
-		end()
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		end, err := tr.BeginStart(t.Context(), trackedActorUID, "s1")
-		if err != nil {
-			t.Errorf("BeginStart(s1): %v", err)
-			return
-		}
-		end()
-	}()
-	select {
-	case <-done:
-		t.Fatal("BeginStart(s1) returned while a prune of s1 was still running")
-	case <-time.After(200 * time.Millisecond):
-	}
-	close(release)
-	waitClosed(t, done, "BeginStart(s1) once the prune ended")
-	if localSnapshotExists("s1") {
-		t.Error("s1 survived the prune")
-	}
-}
-
 // A context that ends while waiting for a running prune returns its error,
 // and the prune itself goes on to completion.
 func TestBeginCheckpointHonorsContextWhileAPruneRuns(t *testing.T) {
@@ -312,9 +269,8 @@ func TestPruneRunsWhileAnUploadIsInFlight(t *testing.T) {
 }
 
 // A checkpoint whose inline prune fails makes one attempt and goes on to hold
-// the actor; the prune is retried in the background once its backoff has
-// passed, no sooner even if a worker finds the actor queued from before the
-// failure, and the actor's entry is dropped once it succeeds.
+// the actor. The snapshot stays listed, a worker does not retry it at once,
+// and the next change to the actor, here the checkpoint's end, tries again.
 func TestBeginCheckpointMakesOnePruneAttemptWhenItFails(t *testing.T) {
 	tr := newIdleTestTracker(t, nil) // workers not started
 	calls := failRemovals(tr)
@@ -323,26 +279,30 @@ func TestBeginCheckpointMakesOnePruneAttemptWhenItFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginCheckpoint: %v", err)
 	}
-	end()
 	if n := calls.Load(); n != 1 {
 		t.Errorf("BeginCheckpoint tried the failing prune %d times, want 1", n)
 	}
 	if !localSnapshotExists("s1") || !pruneDue(tr) {
 		t.Fatal("a failed prune left s1 deleted or no prune due")
 	}
+	end()
 
-	restoreRemovals(tr)
-	// The second pause queued the actor before the failure set its backoff:
-	// a worker that takes it now waits the backoff out rather than retry.
-	stepTo(tr, tr.clock.Now().Add(pruneRetryDelay-time.Second))
+	// The second pause queued the actor before the failure. The worker's
+	// attempt fails too, and the actor is not queued again by the failure.
 	processNextPrune(t, tr)
-	if !localSnapshotExists("s1") {
-		t.Fatal("the prune was retried before its backoff passed")
+	if n := calls.Load(); n != 2 {
+		t.Errorf("the worker tried the failing prune %d times in total, want 2", n)
 	}
-	stepTo(tr, tr.clock.Now().Add(time.Second))
+	if got := tr.pruning.queue.Len(); got != 0 {
+		t.Errorf("prune queue holds %d actors after a failed prune, want 0: a failure must not queue a retry at once", got)
+	}
+
+	// The next change to the actor queues it again, and the prune succeeds.
+	restoreRemovals(tr)
+	commitLocalSnapshot(t, tr, "s3", 3)
 	processNextPrune(t, tr)
-	if localSnapshotExists("s1") {
-		t.Error("the prune was not retried once its backoff passed")
+	if localSnapshotExists("s1") || localSnapshotExists("s2") || !localSnapshotExists("s3") {
+		t.Errorf("after the retry: s1 exists = %v, s2 exists = %v, s3 exists = %v; want only s3", localSnapshotExists("s1"), localSnapshotExists("s2"), localSnapshotExists("s3"))
 	}
 	if pruneDue(tr) || inMemory(tr) {
 		t.Errorf("after the retry: prune due = %v, in memory = %v; want neither", pruneDue(tr), inMemory(tr))
@@ -380,44 +340,8 @@ func TestForgetWaitsForARunningPrune(t *testing.T) {
 	}
 }
 
-// A Run or Restore that finds a prune and an upload both in progress waits
-// for the prune only: it goes on as soon as the prune ends, however long the
-// upload runs.
-func TestBeginStartWaitsForThePruneNotTheUpload(t *testing.T) {
-	store := newFakeSnapshotStore()
-	store.setBlocking(true)
-	tr := newTestTracker(t, store)
-	commitSnapshotDir(t, tr, testRef("s1", 1, tr.clock.Now()))
-	stepTo(tr, tr.clock.Now().Add(testUploadDelay))
-	<-store.started // s1 is uploading, held open
-	defer func() { store.release <- nil }()
-	commitLocalSnapshot(t, tr, "s2", 2)
-	eventually(t, "the second pause's prune ends", func() bool { return !pruneDue(tr) })
-	started, release := blockRemovals(tr)
-	commitLocalSnapshot(t, tr, "s3", 3)
-	<-started // a worker is deleting s2, held open
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		end, err := tr.BeginStart(t.Context(), trackedActorUID, "s2")
-		if err != nil {
-			t.Errorf("BeginStart: %v", err)
-			return
-		}
-		end()
-	}()
-	select {
-	case <-done:
-		t.Fatal("BeginStart(s2) returned while a prune of s2 was still running")
-	case <-time.After(200 * time.Millisecond):
-	}
-	close(release)
-	waitClosed(t, done, "BeginStart(s2) once the prune ended, with the upload still running")
-}
-
 // A prune does not run while a Run, Restore, Checkpoint, or PromoteSnapshot
-// holds the actor, even once its backoff has passed: the hold's end queues it.
+// holds the actor: the hold's end queues it.
 func TestPruneDefersWhileTheActorIsHeld(t *testing.T) {
 	tr := newIdleTestTracker(t, nil) // workers not started
 	calls := failRemovals(tr)
@@ -430,8 +354,7 @@ func TestPruneDefersWhileTheActorIsHeld(t *testing.T) {
 		t.Fatalf("BeginCheckpoint tried the failing prune %d times, want 1", n)
 	}
 	restoreRemovals(tr)
-	stepTo(tr, tr.clock.Now().Add(pruneRetryDelay))
-	processNextPrune(t, tr)
+	processNextPrune(t, tr) // queued by the second pause; the hold defers it
 	if !localSnapshotExists("s1") {
 		t.Fatal("a prune ran while a Checkpoint held the actor")
 	}
@@ -468,76 +391,84 @@ func TestPruneAfterRestartDeletesOnlyListedSnapshots(t *testing.T) {
 	}
 }
 
-// A Checkpoint that leaves a copy of its snapshot behind without committing
-// it, as one that fails partway through keeping the copy does, lists the copy
-// for a prune when it ends. One that left no copy lists nothing, and a retry
-// that commits the snapshot takes it off the list.
-func TestCheckpointEndListsALeftoverCopy(t *testing.T) {
-	tr := newIdleTestTracker(t, nil) // workers not started
-	commitLocalSnapshot(t, tr, "s1", 1)
-	s2 := localRef("s2", 2, tr.clock.Now())
+// BeginStart tells a Restore whether it may read the requested snapshot's
+// local copy in place: not while the snapshot is listed to prune, whether the
+// prune is queued, running, or waiting for an upload of the snapshot to end.
+// It waits for no prune. A Run, or a Restore of LatestLocal, may use the copy.
+func TestBeginStartReportsWhetherTheLocalCopyIsUsable(t *testing.T) {
+	t.Run("listed and queued", func(t *testing.T) {
+		tr := newIdleTestTracker(t, nil) // workers not started: the prune stays queued
+		commitLocalSnapshots(t, tr, "s1", "s2")
+		for uuid, want := range map[string]bool{"s1": false, "s2": true, "": true} {
+			useLocal, end, err := tr.BeginStart(t.Context(), trackedActorUID, uuid)
+			if err != nil {
+				t.Fatalf("BeginStart(%q): %v", uuid, err)
+			}
+			end()
+			if useLocal != want {
+				t.Errorf("BeginStart(%q) useLocal = %v, want %v", uuid, useLocal, want)
+			}
+		}
+	})
 
-	_, end, err := tr.BeginCheckpoint(t.Context(), trackedActorUID, s2.Snapshot, ateletpb.UploadMode_UPLOAD_MODE_DEFERRED)
-	if err != nil {
-		t.Fatalf("BeginCheckpoint: %v", err)
-	}
-	end() // failed before writing anything
-	if got := pruneList(); got != nil {
-		t.Fatalf("state file lists %v to prune after a checkpoint that left no copy, want none", got)
-	}
+	t.Run("being pruned", func(t *testing.T) {
+		tr := newIdleTestTracker(t, nil)
+		started, release := blockRemovals(tr)
+		defer close(release)
+		tr.Start()
+		commitLocalSnapshots(t, tr, "s1", "s2")
+		<-started // a worker is deleting s1, held open
+		returnsPromptly(t, "BeginStart during a prune of s1", func() {
+			useLocal, end, err := tr.BeginStart(t.Context(), trackedActorUID, "s1")
+			if err != nil {
+				t.Errorf("BeginStart(s1): %v", err)
+				return
+			}
+			end()
+			if useLocal {
+				t.Error("BeginStart(s1) useLocal = true while a prune of s1 runs, want false")
+			}
+		})
+	})
 
-	if _, end, err = tr.BeginCheckpoint(t.Context(), trackedActorUID, s2.Snapshot, ateletpb.UploadMode_UPLOAD_MODE_DEFERRED); err != nil {
-		t.Fatalf("BeginCheckpoint: %v", err)
-	}
-	if err := os.MkdirAll(ateletpath.LocalSnapshotDir(trackedActorUID, "s2"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	end() // failed after writing the copy, before the commit
-	if got := pruneList(); !slices.Equal(got, []string{"s2"}) {
-		t.Fatalf("state file lists %v to prune, want [s2]", got)
-	}
-
-	// The next checkpoint prunes the leftover copy before it writes. While
-	// that prune fails, the checkpoint fails with Unavailable rather than
-	// write s2 under a listed copy.
-	calls := failRemovals(tr)
-	if _, _, err := tr.BeginCheckpoint(t.Context(), trackedActorUID, s2.Snapshot, ateletpb.UploadMode_UPLOAD_MODE_DEFERRED); apierror.Code(err) != codes.Unavailable {
-		t.Fatalf("BeginCheckpoint with s2's copy still listed = %v, want Unavailable", err)
-	}
-	if n := calls.Load(); n != 1 {
-		t.Errorf("the failing prune was tried %d times, want 1", n)
-	}
-	restoreRemovals(tr)
-	if _, end, err = tr.BeginCheckpoint(t.Context(), trackedActorUID, s2.Snapshot, ateletpb.UploadMode_UPLOAD_MODE_DEFERRED); err != nil {
-		t.Fatalf("BeginCheckpoint once the prune can run: %v", err)
-	}
-	end()
-	if localSnapshotExists("s2") || pruneList() != nil {
-		t.Errorf("after the checkpoint began: s2 exists = %v, listed = %v; want the copy pruned and nothing listed", localSnapshotExists("s2"), pruneList())
-	}
+	t.Run("listed while its upload runs", func(t *testing.T) {
+		store := newFakeSnapshotStore()
+		store.setBlocking(true)
+		tr := newTestTracker(t, store)
+		commitSnapshotDir(t, tr, testRef("s1", 1, tr.clock.Now()))
+		stepTo(tr, tr.clock.Now().Add(testUploadDelay))
+		<-store.started // s1 is uploading, held open
+		defer func() { store.release <- nil }()
+		commitLocalSnapshot(t, tr, "s2", 2) // lists s1, which the upload keeps
+		if pruneDue(tr) {
+			t.Fatal("a prune is due while the upload keeps s1")
+		}
+		useLocal, end, err := tr.BeginStart(t.Context(), trackedActorUID, "s1")
+		if err != nil {
+			t.Fatalf("BeginStart(s1): %v", err)
+		}
+		end()
+		if useLocal {
+			t.Error("BeginStart(s1) useLocal = true while s1 is listed and uploading, want false")
+		}
+	})
 }
 
-// A Restore of a listed snapshot, as a resume after a revert to an older
-// generation can be, has that snapshot pruned before it begins, so it reads
-// the durable copy rather than a local copy a later prune deletes under the
-// running workload. While the prune fails, the Restore fails with Unavailable.
-func TestBeginStartPrunesAListedSnapshotFirst(t *testing.T) {
-	tr := newIdleTestTracker(t, nil) // workers not started
-	commitLocalSnapshots(t, tr, "s1", "s2")
+// A retry of a Checkpoint whose snapshot is committed already writes nothing,
+// so it runs no prune first: the pause that committed the snapshot is over.
+func TestBeginCheckpointOfACommittedSnapshotRunsNoPrune(t *testing.T) {
+	tr := newIdleTestTracker(t, nil) // workers not started: the prune stays queued
 	calls := failRemovals(tr)
-	if _, err := tr.BeginStart(t.Context(), trackedActorUID, "s1"); apierror.Code(err) != codes.Unavailable {
-		t.Fatalf("BeginStart(s1) while its prune fails = %v, want Unavailable", err)
-	}
-	if n := calls.Load(); n != 1 || !localSnapshotExists("s1") {
-		t.Fatalf("the failing prune was tried %d times and s1 exists = %v; want 1 and true", n, localSnapshotExists("s1"))
-	}
-	restoreRemovals(tr)
-	end, err := tr.BeginStart(t.Context(), trackedActorUID, "s1")
-	if err != nil {
-		t.Fatalf("BeginStart(s1): %v", err)
+	commitLocalSnapshots(t, tr, "s1", "s2")
+	committed, end, err := tr.BeginCheckpoint(t.Context(), trackedActorUID, localRef("s2", 2, tr.clock.Now()).Snapshot, ateletpb.UploadMode_UPLOAD_MODE_DEFERRED)
+	if err != nil || !committed {
+		t.Fatalf("BeginCheckpoint(s2 again) = (%v, %v), want (true, nil)", committed, err)
 	}
 	end()
-	if localSnapshotExists("s1") || !localSnapshotExists("s2") {
-		t.Errorf("after BeginStart(s1): s1 exists = %v, s2 exists = %v; want s1 pruned and s2 kept", localSnapshotExists("s1"), localSnapshotExists("s2"))
+	if n := calls.Load(); n != 0 {
+		t.Errorf("the retry tried a prune %d times, want 0", n)
+	}
+	if !pruneDue(tr) {
+		t.Error("the retry cleared the prune due, want it left for a worker")
 	}
 }
